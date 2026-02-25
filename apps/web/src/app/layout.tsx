@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import type { ReactNode } from "react";
 import { Inter } from "next/font/google";
+import "./globals.css";
 
 // Ha van globals.css a src/app alatt, ez fogja betölteni a Tailwindet / globál CSS-t
 import "./globals.css";
