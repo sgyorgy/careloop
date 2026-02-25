@@ -533,7 +533,7 @@ export default function PatientPage() {
                     : "Add at least 2 entries to see trends."}
                 </p>
 
-                <div className="mt-5 h-[320px] w-full rounded-2xl border border-slate-200 bg-white p-3">
+                <div className="mt-5 w-full" style={{ height: 320 }}>
                   <ResponsiveContainer width="100%" height="100%">
                     <LineChart data={trend}>
                       <CartesianGrid strokeDasharray="3 3" />
