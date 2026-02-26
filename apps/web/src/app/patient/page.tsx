@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
+import { z } from "zod";
 import {
   CartesianGrid,
   Legend,
@@ -14,6 +15,7 @@ import {
   YAxis,
 } from "recharts";
 
+// ---------------- types ----------------
 type DiaryEntry = {
   date: string; // YYYY-MM-DD
   symptomScore: number; // 0-10
@@ -38,19 +40,78 @@ type DiarySummary = {
   last7DaysAvgSymptom: number | null;
 };
 
+type TaskItem = {
+  id: string;
+  text: string;
+  done: boolean;
+  updatedAt?: number;
+};
+
+// ---------------- storage keys ----------------
 const LS_KEYS = {
   diary: "careloop.demoDiary.v1",
-  transcript: "careloop.demoTranscript.v1",
-  loadedAt: "careloop.demoLoadedAt.v1",
-  tasks: "careloop.planTasks.v1",
+  tasks: "careloop.planTasks.v1", // currently string[]
+  tasksState: "careloop.planTasksState.v1", // { [taskId]: { done, updatedAt } }
+  preVisitSummary: "careloop.preVisitSummary.v1",
+  transcript: "careloop.demoTranscript.v1", // reuse for demo "send to clinician"
 } as const;
 
+// ---------------- schemas ----------------
+const DiaryEntrySchema = z.object({
+  date: z.string().min(8),
+  symptomScore: z.number().min(0).max(10),
+  sleepHours: z.number().min(0).max(24),
+  moodScore: z.number().min(0).max(10),
+  notes: z.string().optional(),
+  tags: z.array(z.string()).optional(),
+});
+
+const TrendResponseSchema = z.object({
+  trend: z.array(
+    z.object({
+      date: z.string(),
+      symptomScore: z.number(),
+      sleepHours: z.number(),
+      moodScore: z.number(),
+    })
+  ),
+});
+
+const SummaryResponseSchema = z.object({
+  summary: z.object({
+    headline: z.string(),
+    bullets: z.array(z.string()),
+    possibleTriggers: z.array(z.string()),
+    gentleSuggestions: z.array(z.string()),
+    last7DaysAvgSymptom: z.number().nullable(),
+  }),
+});
+
+const RedactResponseSchema = z.object({
+  redacted: z.string(),
+  piiDetected: z.boolean().optional(),
+});
+
+const TranscribeResponseSchema = z.object({
+  transcript: z.string(),
+  segments: z
+    .array(
+      z.object({
+        startMs: z.number().int().nonnegative(),
+        endMs: z.number().int().nonnegative(),
+        text: z.string().min(1),
+      })
+    )
+    .optional(),
+  warnings: z.array(z.string()).optional(),
+});
+
+// ---------------- helpers ----------------
 function clamp(n: number, lo: number, hi: number) {
   return Math.max(lo, Math.min(hi, n));
 }
 
 function todayISO(): string {
-  // Keep it simple and stable in client
   const d = new Date();
   const yyyy = d.getFullYear();
   const mm = String(d.getMonth() + 1).padStart(2, "0");
@@ -125,19 +186,16 @@ function extractTagStats(diary: DiaryEntry[]) {
 }
 
 function localRedact(text: string): string {
-  // Lightweight redaction for demo. (Do NOT treat as full PHI redaction.)
   let t = text;
-
-  // email
   t = t.replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, "[REDACTED_EMAIL]");
-  // phone-ish
   t = t.replace(
     /(\+?\d{1,3}[\s-]?)?(\(?\d{2,3}\)?[\s-]?)?\d{3}[\s-]?\d{3,4}\b/g,
     "[REDACTED_PHONE]"
   );
-  // addresses-ish (very rough)
-  t = t.replace(/\b(\d{1,4}\s+)?[A-Za-zÀ-ž.'-]+\s+(street|st|road|rd|ave|avenue|utca|u\.|út|krt\.|körút)\b/gi, "[REDACTED_ADDR]");
-
+  t = t.replace(
+    /\b(\d{1,4}\s+)?[A-Za-zÀ-ž.'-]+\s+(street|st|road|rd|ave|avenue|utca|u\.|út|krt\.|körút)\b/gi,
+    "[REDACTED_ADDR]"
+  );
   return t;
 }
 
@@ -147,8 +205,35 @@ async function apiPost<T>(path: string, body: unknown): Promise<T> {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  if (!res.ok) throw new Error(`API ${path} failed: ${res.status}`);
-  return (await res.json()) as T;
+
+  const text = await res.text();
+  const json = text ? (JSON.parse(text) as any) : null;
+
+  if (!res.ok) {
+    const msg = json?.error ? String(json.error) : `API ${path} failed: ${res.status}`;
+    const err = new Error(msg) as Error & { status?: number; payload?: any };
+    err.status = res.status;
+    err.payload = json;
+    throw err;
+  }
+
+  return json as T;
+}
+
+async function apiPostForm<T>(path: string, form: FormData): Promise<T> {
+  const res = await fetch(`/api${path}`, { method: "POST", body: form });
+  const text = await res.text();
+  const json = text ? (JSON.parse(text) as any) : null;
+
+  if (!res.ok) {
+    const msg = json?.error ? String(json.error) : `API ${path} failed: ${res.status}`;
+    const err = new Error(msg) as Error & { status?: number; payload?: any };
+    err.status = res.status;
+    err.payload = json;
+    throw err;
+  }
+
+  return json as T;
 }
 
 function downloadJson(filename: string, obj: unknown) {
@@ -163,6 +248,99 @@ function downloadJson(filename: string, obj: unknown) {
   URL.revokeObjectURL(url);
 }
 
+function stableId(text: string) {
+  // tiny stable hash (not crypto)
+  let h = 2166136261;
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return `t_${(h >>> 0).toString(16)}`;
+}
+
+function computeInsights(diary: DiaryEntry[]) {
+  const last7 = lastNDays(diary, 7);
+  const last14 = lastNDays(diary, 14);
+
+  const avg7Sym = avg(last7.map((e) => e.symptomScore));
+  const avg7Sleep = avg(last7.map((e) => e.sleepHours));
+  const avg7Mood = avg(last7.map((e) => e.moodScore));
+
+  const avg14Sym = avg(last14.map((e) => e.symptomScore));
+
+  // quick “trend”: compare first 3 days vs last 3 days of last7
+  const first3 = last7.slice(0, 3).map((e) => e.symptomScore);
+  const last3 = last7.slice(-3).map((e) => e.symptomScore);
+  const d = (avg(last3) ?? 0) - (avg(first3) ?? 0);
+
+  const direction =
+    last7.length >= 6
+      ? d >= 1
+        ? "worsening"
+        : d <= -1
+        ? "improving"
+        : "stable"
+      : "insufficient-data";
+
+  const worst = last7.reduce(
+    (acc, e) => (!acc || e.symptomScore > acc.symptomScore ? e : acc),
+    null as DiaryEntry | null
+  );
+
+  const redFlag =
+    (worst?.symptomScore ?? 0) >= 9 || (avg7Sym != null && avg14Sym != null && avg7Sym - avg14Sym >= 2);
+
+  return {
+    avg7Sym,
+    avg7Sleep,
+    avg7Mood,
+    direction,
+    worst,
+    redFlag,
+  };
+}
+
+type RedactionMode = "local" | "api" | "none";
+
+// best-effort: redact only notes; numbers/tags are safe-ish synthetic fields
+async function prepareDiaryForApi(diary: DiaryEntry[], mode: RedactionMode) {
+  if (mode === "none") return { diary, piiDetected: false };
+
+  if (mode === "local") {
+    return {
+      diary: diary.map((e) => ({ ...e, notes: localRedact(e.notes) })),
+      piiDetected: false,
+    };
+  }
+
+  // API redaction: redact notes (bounded to last 30 for speed)
+  const limited = diary.slice(-30);
+  let piiDetectedAny = false;
+
+  const redactedNotes: string[] = [];
+  for (const e of limited) {
+    const note = String(e.notes ?? "").trim();
+    if (!note) {
+      redactedNotes.push(note);
+      continue;
+    }
+    // avoid sending huge notes
+    const payloadText = note.slice(0, 20000);
+    const resp = await apiPost<{ redacted: string; piiDetected?: boolean }>("/privacy/redact", { text: payloadText });
+    const parsed = RedactResponseSchema.safeParse(resp);
+    const redacted = parsed.success ? parsed.data.redacted : localRedact(payloadText);
+    piiDetectedAny = piiDetectedAny || Boolean(parsed.success && parsed.data.piiDetected);
+    redactedNotes.push(redacted);
+  }
+
+  const merged = diary.slice(0, Math.max(0, diary.length - limited.length)).concat(
+    limited.map((e, i) => ({ ...e, notes: redactedNotes[i] ?? "" }))
+  );
+
+  return { diary: merged, piiDetected: piiDetectedAny };
+}
+
+// ---------------- component ----------------
 export default function PatientPage() {
   const searchParams = useSearchParams();
   const tab = (searchParams.get("tab") || "diary") as "diary" | "tasks";
@@ -172,13 +350,22 @@ export default function PatientPage() {
   const [trend, setTrend] = useState<TrendPoint[]>([]);
   const [summary, setSummary] = useState<DiarySummary | null>(null);
 
-  const [busy, setBusy] = useState<{ trends: boolean; summary: boolean }>({
+  const [busy, setBusy] = useState<{ trends: boolean; summary: boolean; transcribe: boolean; redact: boolean }>({
     trends: false,
     summary: false,
+    transcribe: false,
+    redact: false,
   });
-  const [err, setErr] = useState<string | null>(null);
 
-  const [redactBeforeProcessing, setRedactBeforeProcessing] = useState(true);
+  const [err, setErr] = useState<string | null>(null);
+  const [notes, setNotes] = useState<string[]>([]);
+
+  const [redactionMode, setRedactionMode] = useState<RedactionMode>("local");
+  const [windowDays, setWindowDays] = useState<7 | 30>(7);
+
+  // Voice diary (optional)
+  const [audioFile, setAudioFile] = useState<File | null>(null);
+  const [sttWarnings, setSttWarnings] = useState<string[]>([]);
 
   // Entry form
   const [form, setForm] = useState<DiaryEntry>({
@@ -191,14 +378,49 @@ export default function PatientPage() {
   });
   const [tagInput, setTagInput] = useState("");
 
-  const tasks = useMemo(() => {
-    const raw = typeof window !== "undefined" ? localStorage.getItem(LS_KEYS.tasks) : null;
-    const parsed = raw ? safeJsonParse<string[]>(raw) : null;
-    return Array.isArray(parsed) ? parsed : [];
+  // Tasks + adherence state
+  const tasksRaw = useMemo(() => {
+    try {
+      const raw = typeof window !== "undefined" ? localStorage.getItem(LS_KEYS.tasks) : null;
+      const parsed = raw ? safeJsonParse<string[]>(raw) : null;
+      return Array.isArray(parsed) ? parsed.map(String).filter(Boolean) : [];
+    } catch {
+      return [];
+    }
   }, [tab]);
 
+  const tasksStateRaw = useMemo(() => {
+    try {
+      const raw = typeof window !== "undefined" ? localStorage.getItem(LS_KEYS.tasksState) : null;
+      const parsed = raw ? safeJsonParse<Record<string, { done: boolean; updatedAt?: number }>>(raw) : null;
+      return parsed && typeof parsed === "object" ? parsed : {};
+    } catch {
+      return {};
+    }
+  }, [tab]);
+
+  const tasks: TaskItem[] = useMemo(() => {
+    return tasksRaw.slice(0, 50).map((t) => {
+      const id = stableId(t);
+      const state = tasksStateRaw[id];
+      return {
+        id,
+        text: t,
+        done: Boolean(state?.done),
+        updatedAt: state?.updatedAt,
+      };
+    });
+  }, [tasksRaw, tasksStateRaw]);
+
+  const adherence = useMemo(() => {
+    if (!tasks.length) return null;
+    const done = tasks.filter((t) => t.done).length;
+    const pct = Math.round((done / tasks.length) * 100);
+    return { done, total: tasks.length, pct };
+  }, [tasks]);
+
   useEffect(() => {
-    // Load diary from localStorage if present (demo or persisted)
+    // Load diary from localStorage if present
     try {
       const raw = localStorage.getItem(LS_KEYS.diary);
       if (raw) {
@@ -209,7 +431,7 @@ export default function PatientPage() {
           setTrend(computeLocalTrends(normalized));
         }
       } else if (demo) {
-        // If user lands here with demo=1 but storage empty, do nothing (home page loads demo)
+        // Home page loads demo; do nothing here
       }
     } catch {
       // ignore
@@ -217,7 +439,6 @@ export default function PatientPage() {
   }, [demo]);
 
   useEffect(() => {
-    // Keep trend in sync locally
     setTrend(computeLocalTrends(diary));
   }, [diary]);
 
@@ -243,18 +464,34 @@ export default function PatientPage() {
 
   function addEntry() {
     setErr(null);
-    const entry: DiaryEntry = {
+    setNotes([]);
+
+    const parsed = DiaryEntrySchema.safeParse({
+      ...form,
       date: String(form.date).slice(0, 10),
       symptomScore: clamp(Number(form.symptomScore), 0, 10),
       sleepHours: clamp(Number(form.sleepHours), 0, 24),
       moodScore: clamp(Number(form.moodScore), 0, 10),
       notes: String(form.notes ?? "").slice(0, 4000),
       tags: (form.tags ?? []).slice(0, 12),
+    });
+
+    if (!parsed.success) {
+      setErr("Invalid entry. Please check the inputs.");
+      return;
+    }
+
+    const entry: DiaryEntry = {
+      date: parsed.data.date.slice(0, 10),
+      symptomScore: parsed.data.symptomScore,
+      sleepHours: parsed.data.sleepHours,
+      moodScore: parsed.data.moodScore,
+      notes: String(parsed.data.notes ?? ""),
+      tags: parsed.data.tags ?? [],
     };
 
     const next = normalizeDiary([...diary, entry]);
     persistDiary(next);
-    // keep date moving forward
     setForm((f) => ({ ...f, date: todayISO(), notes: "" }));
   }
 
@@ -263,8 +500,9 @@ export default function PatientPage() {
     persistDiary(next);
   }
 
-  function clearAll() {
+  function clearDiaryOnly() {
     setErr(null);
+    setNotes([]);
     setSummary(null);
     persistDiary([]);
     try {
@@ -274,23 +512,41 @@ export default function PatientPage() {
     }
   }
 
+  function clearAllDemoData() {
+    setErr(null);
+    setNotes([]);
+    setSummary(null);
+    setDiary([]);
+    setTrend([]);
+    try {
+      localStorage.removeItem(LS_KEYS.diary);
+      localStorage.removeItem(LS_KEYS.tasks);
+      localStorage.removeItem(LS_KEYS.tasksState);
+      localStorage.removeItem(LS_KEYS.preVisitSummary);
+      // keep transcript if you want; but for hard reset, remove it:
+      // localStorage.removeItem(LS_KEYS.transcript);
+    } catch {
+      // ignore
+    }
+  }
+
   async function refreshTrends() {
     setErr(null);
+    setNotes([]);
     setBusy((b) => ({ ...b, trends: true }));
-    try {
-      const payloadDiary = redactBeforeProcessing
-        ? diary.map((e) => ({ ...e, notes: localRedact(e.notes) }))
-        : diary;
 
-      // If backend has /diary/trends, use it; else fallback
-      const resp = await apiPost<{ trend: TrendPoint[] }>("/diary/trends", {
-        diary: payloadDiary,
-      });
-      if (Array.isArray(resp?.trend)) setTrend(resp.trend);
+    try {
+      const { diary: payloadDiary, piiDetected } = await prepareDiaryForApi(diary, redactionMode);
+      if (piiDetected) setNotes((n) => [...n, "PII detected and redacted (best-effort) before processing."]);
+
+      const resp = await apiPost<unknown>("/diary/trends", { diary: payloadDiary });
+      const parsed = TrendResponseSchema.safeParse(resp);
+
+      if (parsed.success) setTrend(parsed.data.trend);
       else setTrend(computeLocalTrends(diary));
     } catch {
-      // Fallback to local computation
       setTrend(computeLocalTrends(diary));
+      setNotes((n) => [...n, "API unavailable — trends computed locally (demo fallback)."]);
     } finally {
       setBusy((b) => ({ ...b, trends: false }));
     }
@@ -298,28 +554,34 @@ export default function PatientPage() {
 
   async function generateSummary() {
     setErr(null);
+    setNotes([]);
     setBusy((b) => ({ ...b, summary: true }));
-    try {
-      const payloadDiary = redactBeforeProcessing
-        ? diary.map((e) => ({ ...e, notes: localRedact(e.notes) }))
-        : diary;
 
-      // If backend has /diary/summarize, use it; else local
-      const resp = await apiPost<{ summary: DiarySummary }>("/diary/summarize", {
-        diary: payloadDiary,
-      });
-      if (resp?.summary) {
-        setSummary(resp.summary);
+    try {
+      const { diary: payloadDiary, piiDetected } = await prepareDiaryForApi(diary, redactionMode);
+      if (piiDetected) setNotes((n) => [...n, "PII detected and redacted (best-effort) before processing."]);
+
+      const resp = await apiPost<unknown>("/diary/summarize", { diary: payloadDiary });
+      const parsed = SummaryResponseSchema.safeParse(resp);
+
+      if (parsed.success) {
+        setSummary(parsed.data.summary);
+        try {
+          localStorage.setItem(LS_KEYS.preVisitSummary, JSON.stringify(parsed.data.summary));
+        } catch {
+          // ignore
+        }
         return;
       }
-      throw new Error("No summary from API");
+
+      throw new Error("No summary from API.");
     } catch {
       // Local fallback (simple heuristics)
       const last7 = lastNDays(diary, 7);
       const avgSym = avg(last7.map((e) => e.symptomScore));
       const worst = last7.reduce(
-        (acc, e) => (e.symptomScore > acc.symptomScore ? e : acc),
-        last7[0] ?? null
+        (acc, e) => (!acc || e.symptomScore > acc.symptomScore ? e : acc),
+        null as DiaryEntry | null
       );
 
       const tagStats = extractTagStats(last7);
@@ -330,17 +592,11 @@ export default function PatientPage() {
         .map(([k]) => k);
 
       setSummary({
-        headline: diary.length
-          ? "Pre-visit summary (quick)"
-          : "Add a few diary entries to generate a summary",
+        headline: diary.length ? "Pre-visit summary (quick, local)" : "Add a few diary entries to generate a summary",
         bullets: diary.length
           ? [
-              avgSym != null
-                ? `Last 7 days avg symptom score: ${avgSym.toFixed(1)} / 10`
-                : "Not enough data for a 7-day average",
-              worst
-                ? `Worst day (last 7 days): ${worst.date} (symptom ${worst.symptomScore}/10)`
-                : "No worst day available",
+              avgSym != null ? `Last 7 days avg symptom score: ${avgSym.toFixed(1)} / 10` : "Not enough data for a 7-day average",
+              worst ? `Worst day (last 7 days): ${worst.date} (symptom ${worst.symptomScore}/10)` : "No worst day available",
               "Patterns are hints only (not a diagnosis).",
             ]
           : [],
@@ -353,12 +609,130 @@ export default function PatientPage() {
           : [],
         last7DaysAvgSymptom: avgSym,
       });
+
+      setNotes((n) => [...n, "API unavailable — summary generated locally (demo fallback)."]);
     } finally {
       setBusy((b) => ({ ...b, summary: false }));
     }
   }
 
+  async function transcribeDiaryAudioIntoNotes() {
+    setErr(null);
+    setNotes([]);
+    setSttWarnings([]);
+
+    if (!audioFile) {
+      setErr("Choose an audio file first.");
+      return;
+    }
+
+    setBusy((b) => ({ ...b, transcribe: true }));
+    try {
+      const formData = new FormData();
+      formData.append("audio", audioFile);
+
+      const resp = await apiPostForm<unknown>("/transcribe", formData);
+      const parsed = TranscribeResponseSchema.safeParse(resp);
+
+      if (!parsed.success) throw new Error("Bad STT response");
+
+      const t = parsed.data.transcript.trim();
+      if (!t) throw new Error("Empty transcript");
+
+      setForm((f) => ({
+        ...f,
+        notes: f.notes ? `${f.notes}\n${t}` : t,
+        tags: Array.from(new Set([...(f.tags ?? []), "voice"])).slice(0, 12),
+      }));
+
+      if (parsed.data.warnings?.length) setSttWarnings(parsed.data.warnings);
+      setNotes((n) => [...n, "Audio transcribed. Review notes and save as a diary entry."]);
+    } catch {
+      setErr("Transcription failed (or API not running). You can still type notes manually.");
+    } finally {
+      setBusy((b) => ({ ...b, transcribe: false }));
+    }
+  }
+
+  function toggleTaskDone(taskId: string) {
+    try {
+      const raw = localStorage.getItem(LS_KEYS.tasksState);
+      const parsed = raw ? safeJsonParse<Record<string, { done: boolean; updatedAt?: number }>>(raw) : null;
+      const next = parsed && typeof parsed === "object" ? { ...parsed } : {};
+      const current = next[taskId]?.done ?? false;
+      next[taskId] = { done: !current, updatedAt: Date.now() };
+      localStorage.setItem(LS_KEYS.tasksState, JSON.stringify(next));
+      // force re-render by touching state via searchParams dependency is not enough; simplest: update notes
+      setNotes((n) => (n.length ? [...n] : []));
+    } catch {
+      setErr("Could not save task state (browser policy/private mode).");
+    }
+  }
+
   const canAnalyze = diary.length >= 2;
+  const windowedDiary = useMemo(() => {
+    const d = lastNDays(diary, windowDays);
+    return d;
+  }, [diary, windowDays]);
+
+  const windowedTrend = useMemo(() => {
+    const set = new Set(windowedDiary.map((e) => e.date));
+    return trend.filter((p) => set.has(p.date));
+  }, [trend, windowedDiary]);
+
+  const insights = useMemo(() => computeInsights(diary), [diary]);
+
+  const preVisitText = useMemo(() => {
+    const lines: string[] = [];
+    lines.push("PATIENT PRE-VISIT SUMMARY (synthetic / demo)");
+    lines.push(`Window: last ${windowDays} days`);
+    if (insights.avg7Sym != null) lines.push(`Avg symptom (7d): ${insights.avg7Sym.toFixed(1)}/10`);
+    if (insights.avg7Sleep != null) lines.push(`Avg sleep (7d): ${insights.avg7Sleep.toFixed(1)}h`);
+    if (insights.avg7Mood != null) lines.push(`Avg mood (7d): ${insights.avg7Mood.toFixed(1)}/10`);
+    lines.push(`Trend: ${insights.direction}`);
+    if (insights.worst) lines.push(`Worst day (7d): ${insights.worst.date} • symptom ${insights.worst.symptomScore}/10`);
+
+    if (summary?.bullets?.length) {
+      lines.push("");
+      lines.push("Highlights:");
+      for (const b of summary.bullets.slice(0, 8)) lines.push(`- ${b}`);
+    }
+
+    if (summary?.possibleTriggers?.length) {
+      lines.push("");
+      lines.push(`Possible triggers: ${summary.possibleTriggers.slice(0, 6).join(", ")}`);
+    }
+
+    if (adherence) {
+      lines.push("");
+      lines.push(`Plan adherence (demo): ${adherence.pct}% (${adherence.done}/${adherence.total})`);
+      const missed = tasks.filter((t) => !t.done).slice(0, 8);
+      if (missed.length) {
+        lines.push("Open tasks:");
+        for (const m of missed) lines.push(`- ${m.text}`);
+      }
+    }
+
+    return lines.join("\n");
+  }, [summary, insights, adherence, tasks, windowDays]);
+
+  async function copyToClipboard(text: string) {
+    try {
+      await navigator.clipboard.writeText(text);
+      setNotes((n) => [...n, "Copied to clipboard."]);
+    } catch {
+      setErr("Clipboard not available in this browser context.");
+    }
+  }
+
+  function sendPreVisitToClinicianDemo() {
+    try {
+      localStorage.setItem(LS_KEYS.transcript, preVisitText);
+      setNotes((n) => [...n, "Sent to Clinician mode (demo): transcript stored locally."]);
+    } catch {
+      setErr("Could not write to localStorage.");
+    }
+  }
 
   return (
     <main className="min-h-screen bg-gradient-to-b from-white to-slate-50">
@@ -366,15 +740,13 @@ export default function PatientPage() {
         <header className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
           <div>
             <div className="flex items-center gap-3">
-              <h1 className="text-3xl font-semibold tracking-tight text-slate-900">
-                Patient mode
-              </h1>
+              <h1 className="text-3xl font-semibold tracking-tight text-slate-900">Patient mode</h1>
               <span className="rounded-full border border-slate-200 bg-white px-3 py-1 text-xs text-slate-700 shadow-sm">
-                No PHI • Synthetic-first
+                Closed-loop • Synthetic-first
               </span>
             </div>
             <p className="mt-2 max-w-2xl text-sm text-slate-700">
-              Log daily symptoms/sleep/mood and generate trends + a pre-visit summary.
+              Log symptoms/sleep/mood and generate trends + a pre-visit summary. Tasks come from the clinician SOAP Plan.
             </p>
           </div>
 
@@ -420,28 +792,38 @@ export default function PatientPage() {
             </Link>
           </div>
 
-          <label className="flex items-center gap-2 text-sm text-slate-700">
-            <input
-              type="checkbox"
-              className="h-4 w-4 rounded border-slate-300"
-              checked={redactBeforeProcessing}
-              onChange={(e) => setRedactBeforeProcessing(e.target.checked)}
-            />
-            Redact identifiers before processing
-          </label>
+          <div className="flex items-center gap-2">
+            <span className="text-sm text-slate-700">Redaction:</span>
+            <select
+              value={redactionMode}
+              onChange={(e) => setRedactionMode(e.target.value as RedactionMode)}
+              className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 shadow-sm"
+            >
+              <option value="local">Local (demo-safe)</option>
+              <option value="api">API (/privacy/redact)</option>
+              <option value="none">Off</option>
+            </select>
+          </div>
 
           <div className="ml-auto flex flex-wrap gap-2">
             <button
               onClick={() => downloadJson("diary.json", diary)}
               className="rounded-xl border border-slate-200 bg-white px-4 py-2 text-sm font-medium text-slate-900 hover:bg-slate-50"
             >
-              Export JSON
+              Export diary JSON
             </button>
             <button
-              onClick={clearAll}
+              onClick={clearDiaryOnly}
               className="rounded-xl border border-slate-200 bg-white px-4 py-2 text-sm font-medium text-slate-900 hover:bg-slate-50"
             >
               Clear diary
+            </button>
+            <button
+              onClick={clearAllDemoData}
+              className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-800"
+              title="Clears diary + tasks + adherence (demo reset)"
+            >
+              Clear ALL demo data
             </button>
           </div>
         </div>
@@ -451,24 +833,61 @@ export default function PatientPage() {
             {err}
           </div>
         )}
+        {notes.length > 0 && (
+          <div className="mt-4 rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-800">
+            <div className="text-xs font-semibold text-slate-700">Notes</div>
+            <ul className="mt-2 list-disc space-y-1 pl-5">
+              {notes.map((n, i) => (
+                <li key={`${n}-${i}`}>{n}</li>
+              ))}
+            </ul>
+          </div>
+        )}
 
         {tab === "tasks" ? (
           <section className="mt-6 grid gap-6 md:grid-cols-3">
             <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm md:col-span-2">
-              <h2 className="text-lg font-semibold text-slate-900">Plan tasks</h2>
-              <p className="mt-2 text-sm text-slate-700">
-                Tasks are generated from the clinician SOAP “Plan” and saved locally for the demo.
-              </p>
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <h2 className="text-lg font-semibold text-slate-900">Plan tasks</h2>
+                  <p className="mt-2 text-sm text-slate-700">
+                    Tasks are generated from the clinician SOAP “Plan” and saved locally for the demo.
+                  </p>
+                </div>
+                {adherence ? (
+                  <div className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-900">
+                    <div className="text-xs font-semibold text-slate-700">Adherence</div>
+                    <div className="mt-1">
+                      <span className="text-lg font-semibold">{adherence.pct}%</span>{" "}
+                      <span className="text-xs text-slate-600">
+                        ({adherence.done}/{adherence.total})
+                      </span>
+                    </div>
+                  </div>
+                ) : null}
+              </div>
 
               {tasks.length ? (
                 <ul className="mt-4 space-y-2">
-                  {tasks.map((t, i) => (
+                  {tasks.map((t) => (
                     <li
-                      key={`${t}-${i}`}
+                      key={t.id}
                       className="flex items-start gap-3 rounded-xl border border-slate-200 bg-slate-50 px-4 py-3"
                     >
-                      <input type="checkbox" className="mt-1 h-4 w-4 rounded border-slate-300" />
-                      <span className="text-sm text-slate-900">{t}</span>
+                      <input
+                        type="checkbox"
+                        checked={t.done}
+                        onChange={() => toggleTaskDone(t.id)}
+                        className="mt-1 h-4 w-4 rounded border-slate-300"
+                      />
+                      <div className="flex-1">
+                        <div className="text-sm text-slate-900">{t.text}</div>
+                        {t.updatedAt ? (
+                          <div className="mt-1 text-[11px] text-slate-500">
+                            Updated: {new Date(t.updatedAt).toLocaleString()}
+                          </div>
+                        ) : null}
+                      </div>
                     </li>
                   ))}
                 </ul>
@@ -481,6 +900,28 @@ export default function PatientPage() {
                   and send the Plan to the patient.
                 </div>
               )}
+
+              <div className="mt-5 flex flex-wrap gap-2">
+                <button
+                  onClick={() => copyToClipboard(preVisitText)}
+                  className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-800"
+                >
+                  Copy check-in summary
+                </button>
+                <button
+                  onClick={sendPreVisitToClinicianDemo}
+                  className="rounded-xl border border-slate-200 bg-white px-4 py-2 text-sm font-medium text-slate-900 hover:bg-slate-50"
+                  title="Stores a synthetic “transcript” for Clinician mode"
+                >
+                  Send check-in → Clinician (demo)
+                </button>
+                <Link
+                  href="/clinician"
+                  className="rounded-xl border border-slate-200 bg-white px-4 py-2 text-sm font-medium text-slate-900 hover:bg-slate-50"
+                >
+                  Open Clinician mode
+                </Link>
+              </div>
             </div>
 
             <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
@@ -495,10 +936,31 @@ export default function PatientPage() {
           </section>
         ) : (
           <>
+            {/* Trends + Summary */}
             <section className="mt-6 grid gap-6 md:grid-cols-3">
               <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm md:col-span-2">
                 <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-                  <h2 className="text-lg font-semibold text-slate-900">Trends</h2>
+                  <div className="flex items-center gap-3">
+                    <h2 className="text-lg font-semibold text-slate-900">Trends</h2>
+                    <div className="inline-flex rounded-xl border border-slate-200 bg-white p-1 shadow-sm">
+                      <button
+                        onClick={() => setWindowDays(7)}
+                        className={`rounded-lg px-3 py-1.5 text-sm font-medium ${
+                          windowDays === 7 ? "bg-slate-900 text-white" : "text-slate-800 hover:bg-slate-50"
+                        }`}
+                      >
+                        7d
+                      </button>
+                      <button
+                        onClick={() => setWindowDays(30)}
+                        className={`rounded-lg px-3 py-1.5 text-sm font-medium ${
+                          windowDays === 30 ? "bg-slate-900 text-white" : "text-slate-800 hover:bg-slate-50"
+                        }`}
+                      >
+                        30d
+                      </button>
+                    </div>
+                  </div>
 
                   <div className="flex flex-wrap gap-2">
                     <button
@@ -528,14 +990,18 @@ export default function PatientPage() {
                 </div>
 
                 <p className="mt-2 text-sm text-slate-700">
-                  {canAnalyze
-                    ? "Visualize symptoms, sleep, and mood over time."
-                    : "Add at least 2 entries to see trends."}
+                  {canAnalyze ? "Visualize symptoms, sleep, and mood over time." : "Add at least 2 entries to see trends."}
                 </p>
+
+                {insights.redFlag ? (
+                  <div className="mt-4 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+                    Pattern flag (demo): symptoms appear significantly worse recently. Consider discussing with a clinician.
+                  </div>
+                ) : null}
 
                 <div className="mt-5 w-full" style={{ height: 320 }}>
                   <ResponsiveContainer width="100%" height="100%">
-                    <LineChart data={trend}>
+                    <LineChart data={windowedTrend}>
                       <CartesianGrid strokeDasharray="3 3" />
                       <XAxis dataKey="date" tickMargin={8} />
                       <YAxis tickMargin={8} />
@@ -548,8 +1014,30 @@ export default function PatientPage() {
                   </ResponsiveContainer>
                 </div>
 
+                <div className="mt-4 rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-xs text-slate-700">
+                  <div className="font-semibold">Quick insights</div>
+                  <div className="mt-2 grid gap-2 sm:grid-cols-3">
+                    <div>
+                      <div className="text-[11px] text-slate-600">Trend</div>
+                      <div className="text-sm text-slate-900">{insights.direction}</div>
+                    </div>
+                    <div>
+                      <div className="text-[11px] text-slate-600">Avg symptom (7d)</div>
+                      <div className="text-sm text-slate-900">
+                        {insights.avg7Sym != null ? `${insights.avg7Sym.toFixed(1)}/10` : "—"}
+                      </div>
+                    </div>
+                    <div>
+                      <div className="text-[11px] text-slate-600">Avg sleep (7d)</div>
+                      <div className="text-sm text-slate-900">
+                        {insights.avg7Sleep != null ? `${insights.avg7Sleep.toFixed(1)}h` : "—"}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
                 <div className="mt-4 text-xs text-slate-500">
-                  Note: If the API is not running, trends are computed locally for the demo.
+                  If the API isn’t running, trends/summary fall back locally for the demo.
                 </div>
               </div>
 
@@ -603,6 +1091,28 @@ export default function PatientPage() {
                         ))}
                       </ul>
                     </div>
+
+                    <div className="flex flex-wrap gap-2">
+                      <button
+                        onClick={() => copyToClipboard(preVisitText)}
+                        className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-800"
+                      >
+                        Copy pre-visit summary
+                      </button>
+                      <button
+                        onClick={sendPreVisitToClinicianDemo}
+                        className="rounded-xl border border-slate-200 bg-white px-4 py-2 text-sm font-medium text-slate-900 hover:bg-slate-50"
+                        title="Stores summary as a synthetic “transcript” for Clinician mode"
+                      >
+                        Send → Clinician (demo)
+                      </button>
+                      <Link
+                        href="/clinician"
+                        className="rounded-xl border border-slate-200 bg-white px-4 py-2 text-sm font-medium text-slate-900 hover:bg-slate-50"
+                      >
+                        Open Clinician
+                      </Link>
+                    </div>
                   </div>
                 ) : (
                   <div className="mt-4 rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-700">
@@ -616,12 +1126,55 @@ export default function PatientPage() {
               </div>
             </section>
 
+            {/* Add entry + list */}
             <section className="mt-6 grid gap-6 md:grid-cols-3">
               <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm md:col-span-2">
                 <h2 className="text-lg font-semibold text-slate-900">Add diary entry</h2>
                 <p className="mt-2 text-sm text-slate-700">
                   Keep it synthetic for demo. Use tags to help identify patterns (e.g., “dairy”, “stress”, “spicy”).
                 </p>
+
+                {/* Voice input */}
+                <div className="mt-4 rounded-2xl border border-slate-200 bg-slate-50 p-4">
+                  <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                    <div>
+                      <div className="text-xs font-semibold text-slate-700">Voice note (optional)</div>
+                      <div className="mt-1 text-xs text-slate-600">
+                        Transcribe audio into the entry notes (uses <code className="rounded bg-white px-1">/api/transcribe</code>).
+                      </div>
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      <input
+                        type="file"
+                        accept="audio/*"
+                        onChange={(e) => setAudioFile(e.target.files?.[0] ?? null)}
+                        className="block text-sm text-slate-700 file:mr-3 file:rounded-lg file:border-0 file:bg-white file:px-3 file:py-2 file:text-sm file:font-medium file:text-slate-900 file:shadow-sm"
+                      />
+                      <button
+                        onClick={transcribeDiaryAudioIntoNotes}
+                        disabled={busy.transcribe || !audioFile}
+                        className={`rounded-xl px-4 py-2 text-sm font-medium ${
+                          busy.transcribe || !audioFile
+                            ? "cursor-not-allowed bg-slate-100 text-slate-400"
+                            : "bg-slate-900 text-white hover:bg-slate-800"
+                        }`}
+                      >
+                        {busy.transcribe ? "Transcribing…" : "Transcribe"}
+                      </button>
+                    </div>
+                  </div>
+
+                  {sttWarnings.length ? (
+                    <div className="mt-3 rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs text-slate-700">
+                      <div className="font-semibold">STT warnings</div>
+                      <ul className="mt-1 list-disc pl-5">
+                        {sttWarnings.map((w, i) => (
+                          <li key={`${w}-${i}`}>{w}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  ) : null}
+                </div>
 
                 <div className="mt-5 grid gap-4 sm:grid-cols-2">
                   <label className="block">
@@ -635,52 +1188,40 @@ export default function PatientPage() {
                   </label>
 
                   <label className="block">
-                    <span className="text-xs font-semibold text-slate-700">
-                      Symptom score: {form.symptomScore}/10
-                    </span>
+                    <span className="text-xs font-semibold text-slate-700">Symptom score: {form.symptomScore}/10</span>
                     <input
                       type="range"
                       min={0}
                       max={10}
                       step={1}
                       value={form.symptomScore}
-                      onChange={(e) =>
-                        setForm((f) => ({ ...f, symptomScore: Number(e.target.value) }))
-                      }
+                      onChange={(e) => setForm((f) => ({ ...f, symptomScore: Number(e.target.value) }))}
                       className="mt-2 w-full"
                     />
                   </label>
 
                   <label className="block">
-                    <span className="text-xs font-semibold text-slate-700">
-                      Sleep hours: {form.sleepHours.toFixed(1)}
-                    </span>
+                    <span className="text-xs font-semibold text-slate-700">Sleep hours: {form.sleepHours.toFixed(1)}</span>
                     <input
                       type="number"
                       min={0}
                       max={24}
                       step={0.1}
                       value={form.sleepHours}
-                      onChange={(e) =>
-                        setForm((f) => ({ ...f, sleepHours: Number(e.target.value) }))
-                      }
+                      onChange={(e) => setForm((f) => ({ ...f, sleepHours: Number(e.target.value) }))}
                       className="mt-1 w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 shadow-sm"
                     />
                   </label>
 
                   <label className="block">
-                    <span className="text-xs font-semibold text-slate-700">
-                      Mood score: {form.moodScore}/10
-                    </span>
+                    <span className="text-xs font-semibold text-slate-700">Mood score: {form.moodScore}/10</span>
                     <input
                       type="range"
                       min={0}
                       max={10}
                       step={1}
                       value={form.moodScore}
-                      onChange={(e) =>
-                        setForm((f) => ({ ...f, moodScore: Number(e.target.value) }))
-                      }
+                      onChange={(e) => setForm((f) => ({ ...f, moodScore: Number(e.target.value) }))}
                       className="mt-2 w-full"
                     />
                   </label>
@@ -693,32 +1234,28 @@ export default function PatientPage() {
                     onChange={(e) => setForm((f) => ({ ...f, notes: e.target.value }))}
                     placeholder="e.g., 'Bloating after dairy. Better with hydration.'"
                     className="mt-1 w-full rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 shadow-sm"
-                    rows={3}
+                    rows={4}
                   />
                 </label>
 
                 <div className="mt-4">
-                  <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
-                    <div className="flex-1">
-                      <span className="text-xs font-semibold text-slate-700">Tags</span>
-                      <div className="mt-1 flex gap-2">
-                        <input
-                          value={tagInput}
-                          onChange={(e) => setTagInput(e.target.value)}
-                          placeholder="dairy, stress, spicy…"
-                          className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 shadow-sm"
-                        />
-                        <button
-                          onClick={() => {
-                            addTag(tagInput);
-                            setTagInput("");
-                          }}
-                          className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-800"
-                        >
-                          Add
-                        </button>
-                      </div>
-                    </div>
+                  <span className="text-xs font-semibold text-slate-700">Tags</span>
+                  <div className="mt-1 flex gap-2">
+                    <input
+                      value={tagInput}
+                      onChange={(e) => setTagInput(e.target.value)}
+                      placeholder="dairy, stress, spicy…"
+                      className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 shadow-sm"
+                    />
+                    <button
+                      onClick={() => {
+                        addTag(tagInput);
+                        setTagInput("");
+                      }}
+                      className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-800"
+                    >
+                      Add
+                    </button>
                   </div>
 
                   <div className="mt-3 flex flex-wrap gap-2">
@@ -732,9 +1269,7 @@ export default function PatientPage() {
                         {t} ×
                       </button>
                     ))}
-                    {!form.tags?.length && (
-                      <span className="text-xs text-slate-500">No tags</span>
-                    )}
+                    {!form.tags?.length && <span className="text-xs text-slate-500">No tags</span>}
                   </div>
                 </div>
 
@@ -747,7 +1282,6 @@ export default function PatientPage() {
                   </button>
                   <button
                     onClick={() => {
-                      // quick synthetic entry helper
                       setForm((f) => ({
                         ...f,
                         notes:
@@ -765,27 +1299,21 @@ export default function PatientPage() {
 
               <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
                 <h2 className="text-lg font-semibold text-slate-900">Diary entries</h2>
-                <p className="mt-2 text-sm text-slate-700">
-                  {diary.length ? `${diary.length} entries` : "No entries yet."}
-                </p>
+                <p className="mt-2 text-sm text-slate-700">{diary.length ? `${diary.length} entries` : "No entries yet."}</p>
 
                 {diary.length ? (
                   <div className="mt-4 space-y-2">
                     {diary
                       .slice()
                       .reverse()
-                      .slice(0, 10)
+                      .slice(0, 12)
                       .map((e) => (
-                        <div
-                          key={e.date}
-                          className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3"
-                        >
+                        <div key={e.date} className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3">
                           <div className="flex items-start justify-between gap-3">
                             <div>
                               <div className="text-sm font-medium text-slate-900">{e.date}</div>
                               <div className="mt-1 text-xs text-slate-600">
-                                Symptom {e.symptomScore}/10 • Sleep {e.sleepHours.toFixed(1)}h •
-                                Mood {e.moodScore}/10
+                                Symptom {e.symptomScore}/10 • Sleep {e.sleepHours.toFixed(1)}h • Mood {e.moodScore}/10
                               </div>
                             </div>
                             <button
@@ -795,6 +1323,7 @@ export default function PatientPage() {
                               Delete
                             </button>
                           </div>
+
                           {e.tags?.length ? (
                             <div className="mt-2 flex flex-wrap gap-1">
                               {e.tags.map((t) => (
@@ -807,18 +1336,15 @@ export default function PatientPage() {
                               ))}
                             </div>
                           ) : null}
+
                           {e.notes ? (
                             <div className="mt-2 text-xs text-slate-700">
-                              {redactBeforeProcessing ? localRedact(e.notes) : e.notes}
+                              {redactionMode === "local" ? localRedact(e.notes) : e.notes}
                             </div>
                           ) : null}
                         </div>
                       ))}
-                    {diary.length > 10 && (
-                      <div className="text-xs text-slate-500">
-                        Showing last 10 entries (newest first).
-                      </div>
-                    )}
+                    {diary.length > 12 && <div className="text-xs text-slate-500">Showing last 12 entries (newest first).</div>}
                   </div>
                 ) : (
                   <div className="mt-4 rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-700">
@@ -829,6 +1355,11 @@ export default function PatientPage() {
             </section>
           </>
         )}
+
+        <footer className="mt-8 text-xs text-slate-500">
+          API calls go to <code className="rounded bg-slate-100 px-1">/api/*</code> (proxy via{" "}
+          <code className="rounded bg-slate-100 px-1">API_PROXY_TARGET</code>). For demos, keep inputs synthetic.
+        </footer>
       </div>
     </main>
   );
