@@ -333,6 +333,12 @@ const DEFAULT_ENFORCE_REDACTION = (process.env.DEFAULT_ENFORCE_REDACTION ?? "fal
 const DIARY_SUMMARY_MAX_ENTRIES = Math.max(1, Math.min(365, Number(process.env.DIARY_SUMMARY_MAX_ENTRIES ?? 30)));
 const DIARY_NOTES_MAX_CHARS = Math.max(0, Math.min(2000, Number(process.env.DIARY_NOTES_MAX_CHARS ?? 400)));
 
+// Sentiment tracking knobs (optional)
+const SENTIMENT_ENABLED = (process.env.SENTIMENT_ENABLED ?? "true") !== "false";
+const SENTIMENT_DOC_MAX_CHARS = Math.max(200, Math.min(20_000, Number(process.env.SENTIMENT_MAX_CHARS ?? 4000)));
+// Azure Text Analytics request doc limit can be strict; 10 is a safe default
+const SENTIMENT_BATCH_SIZE = Math.max(1, Math.min(10, Number(process.env.SENTIMENT_BATCH_SIZE ?? 10)));
+
 function clamp(n: number, lo: number, hi: number) {
   return Math.max(lo, Math.min(hi, n));
 }
@@ -342,15 +348,30 @@ function mean(nums: number[]) {
   return nums.reduce((a, b) => a + b, 0) / nums.length;
 }
 
+function primaryLangTag(lang?: string) {
+  const raw = String(lang ?? "").trim();
+  if (!raw) return "en";
+  // "hu-HU" -> "hu", "en-US" -> "en"
+  const tag = raw.split(/[-_]/)[0]?.toLowerCase();
+  return tag || "en";
+}
+
+// Memoize clients (cheap + avoids re-instantiation per request)
+let _azureOpenAI: ReturnType<typeof makeAzureOpenAI> | null | undefined;
 function makeAzureOpenAI() {
+  if (_azureOpenAI !== undefined) return _azureOpenAI;
+
   const endpoint = process.env.AZURE_OPENAI_ENDPOINT;
   const apiKey = process.env.AZURE_OPENAI_KEY;
   const deployment = process.env.AZURE_OPENAI_DEPLOYMENT;
   const apiVersion = process.env.AZURE_OPENAI_API_VERSION ?? "2024-02-15-preview";
-  if (!endpoint || !apiKey || !deployment) return null;
+  if (!endpoint || !apiKey || !deployment) {
+    _azureOpenAI = null;
+    return _azureOpenAI;
+  }
 
   const baseURL = `${endpoint.replace(/\/$/, "")}/openai/deployments/${deployment}`;
-  return {
+  _azureOpenAI = {
     client: new OpenAI({
       apiKey,
       baseURL,
@@ -359,13 +380,23 @@ function makeAzureOpenAI() {
     }),
     deployment,
   };
+
+  return _azureOpenAI;
 }
 
+let _textAnalytics: TextAnalyticsClient | null | undefined;
 function makeTextAnalytics() {
+  if (_textAnalytics !== undefined) return _textAnalytics;
+
   const endpoint = process.env.AZURE_LANGUAGE_ENDPOINT;
   const key = process.env.AZURE_LANGUAGE_KEY;
-  if (!endpoint || !key) return null;
-  return new TextAnalyticsClient(endpoint, new AzureKeyCredential(key));
+  if (!endpoint || !key) {
+    _textAnalytics = null;
+    return _textAnalytics;
+  }
+
+  _textAnalytics = new TextAnalyticsClient(endpoint, new AzureKeyCredential(key));
+  return _textAnalytics;
 }
 
 function asLines(v: string[] | string): string[] {
@@ -405,6 +436,74 @@ function normalizeKey(s: string) {
     .replace(/[^\p{L}\p{N}\s\/%μµ.-]/gu, " ")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+// ---- Sentiment (best effort) ----
+type SentimentOut = {
+  label: "positive" | "neutral" | "negative" | "mixed";
+  scores: { positive: number; neutral: number; negative: number };
+  // chart-friendly: ~[-1..+1]
+  compound: number;
+};
+
+async function analyzeSentimentBatchBestEffort(texts: string[]): Promise<Array<SentimentOut | null>> {
+  if (!SENTIMENT_ENABLED) return texts.map(() => null);
+
+  const ta = makeTextAnalytics();
+  if (!ta) return texts.map(() => null);
+
+  const lang = primaryLangTag(process.env.SENTIMENT_LANGUAGE ?? process.env.AZURE_SPEECH_LANG);
+
+  // Prebuild docs; keep track of indices; skip empty docs => null
+  const docsAll: Array<{ id: string; text: string; language: string; idx: number }> = [];
+  const out: Array<SentimentOut | null> = Array(texts.length).fill(null);
+
+  for (let i = 0; i < texts.length; i++) {
+    const t = String(texts[i] ?? "").trim();
+    if (!t) continue;
+    docsAll.push({
+      id: String(docsAll.length), // local id per batch flow
+      text: truncateForProcessing(t, SENTIMENT_DOC_MAX_CHARS),
+      language: lang,
+      idx: i,
+    });
+  }
+
+  // Chunk to avoid service doc-count limits
+  for (let start = 0; start < docsAll.length; start += SENTIMENT_BATCH_SIZE) {
+    const chunk = docsAll.slice(start, start + SENTIMENT_BATCH_SIZE);
+    try {
+      const results = await ta.analyzeSentiment(
+        chunk.map((d) => ({ id: d.id, text: d.text, language: d.language }))
+      );
+
+      const idxById = new Map(chunk.map((d) => [d.id, d.idx] as const));
+
+      for (const r of results) {
+        if ((r as any).error) continue;
+
+        const s = r.confidenceScores;
+        const compound = clamp((s.positive ?? 0) - (s.negative ?? 0), -1, 1);
+
+        const i = idxById.get(String(r.id));
+        if (i == null) continue;
+
+        out[i] = {
+          label: r.sentiment,
+          scores: {
+            positive: s.positive ?? 0,
+            neutral: s.neutral ?? 0,
+            negative: s.negative ?? 0,
+          },
+          compound,
+        };
+      }
+    } catch {
+      // best effort: keep nulls for this chunk
+    }
+  }
+
+  return out;
 }
 
 function mockSoap(transcript: string) {
