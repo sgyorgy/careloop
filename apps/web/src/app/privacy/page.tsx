@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 
 type PhiType = "email" | "phone" | "address" | "dob" | "id_like";
 
@@ -107,21 +107,34 @@ async function apiPost<T>(path: string, body: unknown): Promise<T> {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  if (!res.ok) throw new Error(`API ${path} failed: ${res.status}`);
-  return (await res.json()) as T;
+
+  const text = await res.text();
+  let json: any = null;
+  try {
+    json = text ? JSON.parse(text) : null;
+  } catch {
+    json = null;
+  }
+
+  if (!res.ok) {
+    const msg = json?.error ? String(json.error) : `API ${path} failed: ${res.status}`;
+    throw new Error(msg);
+  }
+
+  return (json ?? {}) as T;
 }
 
 const EXAMPLES = [
   "My email is demo.person@example.com and my phone is +36 20 123 4567. Address: Középtemető utca 1.",
-  "Patient born 2006-04-18 reports abdominal pain after dairy. Call 06-30-555-1234.",
-  "Contact: test.user+hackathon@domain.hu, 1st Avenue, 12. ID: 12345678901",
+  "Lab report: HbA1c 8.2% (ref 4.0–5.6), LDL 4.1 mmol/L (ref <3.0). Patient born 2006-04-18. Call 06-30-555-1234.",
+  "Imaging: Mild spinal stenosis at L4-L5. Status post fracture. Contact: test.user+hackathon@domain.hu, 1st Avenue 12. ID: 12345678901",
 ];
 
 function Badge({
   children,
   tone = "neutral",
 }: {
-  children: React.ReactNode;
+  children: ReactNode;
   tone?: "neutral" | "good" | "warn";
 }) {
   const cls =
@@ -130,11 +143,7 @@ function Badge({
       : tone === "warn"
       ? "border-amber-200 bg-amber-50 text-amber-900"
       : "border-slate-200 bg-white text-slate-700";
-  return (
-    <span className={`rounded-full border px-3 py-1 text-xs shadow-sm ${cls}`}>
-      {children}
-    </span>
-  );
+  return <span className={`rounded-full border px-3 py-1 text-xs shadow-sm ${cls}`}>{children}</span>;
 }
 
 function Toggle({
@@ -178,6 +187,7 @@ export default function PrivacyPage() {
   const [busy, setBusy] = useState(false);
   const [apiError, setApiError] = useState<string | null>(null);
   const [apiRedacted, setApiRedacted] = useState<string | null>(null);
+  const [apiPiiDetected, setApiPiiDetected] = useState<boolean | null>(null);
 
   const [prefs, setPrefs] = useState<PrivacyPrefs>({
     hardGateEnabled: true,
@@ -213,13 +223,10 @@ export default function PrivacyPage() {
   const localOut = useMemo(() => localRedact(text), [text]);
 
   const cloudBlocked =
-    mode === "api" &&
-    prefs.hardGateEnabled &&
-    hasPHI &&
-    !prefs.sendRedactedToApi; // would attempt to send raw PHI
+    mode === "api" && prefs.hardGateEnabled && hasPHI && !prefs.sendRedactedToApi; // would attempt to send raw PHI
 
   const payloadPreview = useMemo(() => {
-    if (mode !== "api") return null;
+    if (mode !== "api") return null as null | { willSend: "raw" | "locally-redacted" | "blocked"; text: string };
     if (!prefs.hardGateEnabled) return { willSend: "raw", text };
     if (!hasPHI) return { willSend: "raw", text };
     if (prefs.sendRedactedToApi) return { willSend: "locally-redacted", text: localOut };
@@ -230,17 +237,17 @@ export default function PrivacyPage() {
     setApiError(null);
     setBusy(true);
     setApiRedacted(null);
+    setApiPiiDetected(null);
 
     try {
-      const toSend =
-        payloadPreview?.willSend === "locally-redacted" ? payloadPreview.text : text;
+      const toSend = payloadPreview?.willSend === "locally-redacted" ? payloadPreview.text : text;
 
       if (payloadPreview?.willSend === "blocked") {
         throw new Error("Blocked by PHI gate");
       }
 
-      // Backend contract: POST /privacy/redact -> { redacted?: string; text?: string }
-      const resp = await apiPost<{ redacted?: string; text?: string }>("/privacy/redact", {
+      // Backend contract: POST /privacy/redact -> { redacted?: string; text?: string; piiDetected?: boolean }
+      const resp = await apiPost<{ redacted?: string; text?: string; piiDetected?: boolean }>("/privacy/redact", {
         text: toSend,
         // helpful hint for backend logs / routing (safe, no content)
         client_mode: payloadPreview?.willSend ?? "raw",
@@ -249,6 +256,7 @@ export default function PrivacyPage() {
       const out = (resp.redacted ?? resp.text ?? "").toString();
       if (!out.trim()) throw new Error("Empty redaction result.");
       setApiRedacted(out);
+      setApiPiiDetected(resp.piiDetected ?? null);
     } catch (e) {
       const msg =
         e instanceof Error && e.message === "Blocked by PHI gate"
@@ -264,26 +272,26 @@ export default function PrivacyPage() {
     try {
       const keys = Object.keys(localStorage);
       const toRemove = keys.filter((k) =>
-        /(careloop|patient|clinician|soap|diary|tasks|demo|visit)/i.test(k)
+        /(careloop|patient|clinician|soap|diary|tasks|demo|visit|report|reports|lab|labs|finding|findings)/i.test(k)
       );
       toRemove.forEach((k) => localStorage.removeItem(k));
       localStorage.removeItem(PREFS_KEY);
       setApiRedacted(null);
       setApiError(null);
+      setApiPiiDetected(null);
     } catch {
       // ignore
     }
   }
 
   function clearAllStorage() {
-    const ok = window.confirm(
-      "This will clear ALL localStorage for this site (not just CareLoop demo data). Continue?"
-    );
+    const ok = window.confirm("This will clear ALL localStorage for this site (not just CareLoop demo data). Continue?");
     if (!ok) return;
     try {
       localStorage.clear();
       setApiRedacted(null);
       setApiError(null);
+      setApiPiiDetected(null);
     } catch {
       // ignore
     }
@@ -295,19 +303,15 @@ export default function PrivacyPage() {
         <header className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
           <div>
             <div className="flex flex-wrap items-center gap-2">
-              <h1 className="text-3xl font-semibold tracking-tight text-slate-900">
-                Privacy & Safety
-              </h1>
+              <h1 className="text-3xl font-semibold tracking-tight text-slate-900">Privacy & Safety</h1>
               <Badge tone="good">Synthetic-first</Badge>
-              <Badge tone={hasPHI ? "warn" : "good"}>
-                {hasPHI ? "PHI detected (demo text)" : "No PHI detected"}
-              </Badge>
+              <Badge tone={hasPHI ? "warn" : "good"}>{hasPHI ? "PHI detected (demo text)" : "No PHI detected"}</Badge>
               <Badge>{prefs.ephemeralMode ? "Ephemeral mode" : "Prefs persisted"}</Badge>
             </div>
             <p className="mt-2 max-w-3xl text-sm text-slate-700">
-              CareLoop is a prototype. Use <b>synthetic</b> or properly <b>anonymized</b> text/audio only.
-              This page demonstrates (1) PHI detection, (2) redaction, and (3) a “hard gate”
-              that prevents cloud-bound processing unless identifiers are masked first.
+              CareLoop is a prototype. Use <b>synthetic</b> or properly <b>anonymized</b> text/audio/report snippets
+              only. This page demonstrates (1) PHI detection, (2) redaction, and (3) a “hard gate” that prevents
+              cloud-bound processing unless identifiers are masked first.
             </p>
           </div>
 
@@ -330,6 +334,12 @@ export default function PrivacyPage() {
             >
               Clinician mode
             </Link>
+            <Link
+              href="/report"
+              className="rounded-xl border border-slate-200 bg-white px-4 py-2 text-sm font-medium text-slate-900 hover:bg-slate-50"
+            >
+              Report interpreter
+            </Link>
           </div>
         </header>
 
@@ -339,7 +349,8 @@ export default function PrivacyPage() {
             <h2 className="text-lg font-semibold text-slate-900">PHI gate + Redaction demo</h2>
             <p className="mt-2 text-sm text-slate-700">
               Pick a sample, edit it, and see what gets flagged and masked. The local redaction is intentionally
-              minimal; API mode demonstrates a stronger server-side approach.
+              minimal; API mode demonstrates a stronger server-side approach (and is what the Report Interpreter should
+              rely on for anything that leaves the browser).
             </p>
 
             <div className="mt-4 flex flex-wrap gap-2">
@@ -350,6 +361,7 @@ export default function PrivacyPage() {
                     setText(ex);
                     setApiRedacted(null);
                     setApiError(null);
+                    setApiPiiDetected(null);
                   }}
                   className="rounded-xl border border-slate-200 bg-white px-4 py-2 text-sm font-medium text-slate-900 hover:bg-slate-50"
                 >
@@ -366,6 +378,7 @@ export default function PrivacyPage() {
                   setText(e.target.value);
                   setApiRedacted(null);
                   setApiError(null);
+                  setApiPiiDetected(null);
                 }}
                 rows={6}
                 className="mt-2 w-full rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 shadow-sm"
@@ -376,9 +389,7 @@ export default function PrivacyPage() {
             <div className="mt-4 rounded-2xl border border-slate-200 bg-slate-50 p-4">
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <div className="text-xs font-semibold text-slate-700">PHI detection (local)</div>
-                <div className="text-xs text-slate-500">
-                  {hasPHI ? `${findingCount} signal(s) found` : "No signals found"}
-                </div>
+                <div className="text-xs text-slate-500">{hasPHI ? `${findingCount} signal(s) found` : "No signals found"}</div>
               </div>
 
               <div className="mt-3 flex flex-wrap gap-2">
@@ -394,7 +405,7 @@ export default function PrivacyPage() {
                   ))
                 ) : (
                   <span className="text-xs text-slate-600">
-                    Tip: try adding an email/phone/address to see the gate trigger.
+                    Tip: try adding an email/phone/address/date of birth to see the gate trigger.
                   </span>
                 )}
               </div>
@@ -469,8 +480,8 @@ export default function PrivacyPage() {
               <div className="text-xs text-slate-500">
                 {mode === "api" ? (
                   <>
-                    Calls <code className="rounded bg-slate-100 px-1">/api/privacy/redact</code> (server-side policy; may
-                    use Azure services if configured).
+                    Calls <code className="rounded bg-slate-100 px-1">/api/privacy/redact</code>. Use this before sending
+                    any report/diary/note content to cloud-backed AI.
                   </>
                 ) : (
                   "Runs in-browser only (demo)."
@@ -483,7 +494,15 @@ export default function PrivacyPage() {
               <div className="mt-4 rounded-2xl border border-slate-200 bg-white p-4">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <div className="text-xs font-semibold text-slate-700">External-processing preview</div>
-                  <Badge tone={payloadPreview.willSend === "raw" ? "warn" : payloadPreview.willSend === "blocked" ? "warn" : "good"}>
+                  <Badge
+                    tone={
+                      payloadPreview.willSend === "raw"
+                        ? "warn"
+                        : payloadPreview.willSend === "blocked"
+                        ? "warn"
+                        : "good"
+                    }
+                  >
                     {payloadPreview.willSend === "raw"
                       ? "Will send: raw"
                       : payloadPreview.willSend === "locally-redacted"
@@ -516,7 +535,14 @@ export default function PrivacyPage() {
               </div>
 
               <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
-                <div className="text-xs font-semibold text-slate-700">API redacted output</div>
+                <div className="flex items-center justify-between gap-2">
+                  <div className="text-xs font-semibold text-slate-700">API redacted output</div>
+                  {mode === "api" && apiPiiDetected !== null && (
+                    <Badge tone={apiPiiDetected ? "warn" : "good"}>
+                      {apiPiiDetected ? "Server flagged PII" : "Server: no PII flagged"}
+                    </Badge>
+                  )}
+                </div>
                 <div className="mt-2 whitespace-pre-wrap text-sm text-slate-900">
                   {apiRedacted ?? (
                     <span className="text-slate-500">
@@ -531,16 +557,16 @@ export default function PrivacyPage() {
 
             {/* Demo hygiene */}
             <div className="mt-4 rounded-2xl border border-slate-200 bg-white p-4 text-xs text-slate-600">
-              <div className="font-semibold text-slate-700">Demo hygiene (what the jury cares about)</div>
+              <div className="font-semibold text-slate-700">Demo hygiene</div>
               <ul className="mt-2 list-disc space-y-1 pl-5">
                 <li>
                   <b>Use synthetic data only</b>. This page intentionally uses “PHI-like” samples to show masking.
                 </li>
                 <li>
-                  <b>No content logging</b>: logs should contain timestamps, status codes, and sizes—never raw notes/transcripts.
+                  <b>No content logging</b>: logs should contain timestamps, status codes, and sizes—never raw notes/transcripts/reports.
                 </li>
                 <li>
-                  The hard gate demonstrates “privacy-by-design”: if identifiers appear, the system blocks or redacts before processing.
+                  The hard gate demonstrates “privacy-by-design”: if identifiers appear, the system blocks or redacts before any external processing.
                 </li>
               </ul>
             </div>
@@ -555,7 +581,8 @@ export default function PrivacyPage() {
                 <div className="text-xs font-semibold text-slate-700">Storage (demo)</div>
                 <div className="mt-1">
                   Recommended: ephemeral + incognito. If other pages store demo state in{" "}
-                  <code className="rounded bg-white px-1">localStorage</code>, you can clear it below.
+                  <code className="rounded bg-white px-1">localStorage</code> (diary, SOAP, tasks, reports), you can
+                  clear it below.
                 </div>
               </div>
 
@@ -573,7 +600,8 @@ export default function PrivacyPage() {
                   Clear ALL site localStorage
                 </button>
                 <div className="text-xs text-slate-500">
-                  “Clear CareLoop” removes keys matching: careloop / patient / clinician / soap / diary / tasks / demo / visit.
+                  “Clear CareLoop” removes keys matching: careloop / patient / clinician / soap / diary / tasks / demo /
+                  visit / report / labs / findings.
                 </div>
               </div>
 
@@ -587,7 +615,7 @@ export default function PrivacyPage() {
               <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3">
                 <div className="text-xs font-semibold text-slate-700">Pitch line</div>
                 <div className="mt-1">
-                  “We don’t just *talk* about compliance — the app enforces it with a PHI gate + redaction before external processing.”
+                  “We don’t just talk about compliance — the app enforces it with a PHI gate + redaction before any external AI processing.”
                 </div>
               </div>
             </div>
