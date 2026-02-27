@@ -108,6 +108,8 @@ const EnvSchema = z.object({
   AZURE_OPENAI_API_VERSION: z.string().min(1).optional(),
   // optional: separate deployment for diary
   AZURE_OPENAI_DIARY_DEPLOYMENT: z.string().min(1).optional(),
+  // optional: separate deployment for reports
+  AZURE_OPENAI_REPORT_DEPLOYMENT: z.string().min(1).optional(),
 
   AZURE_SPEECH_KEY: z.string().min(1).optional(),
   AZURE_SPEECH_REGION: z.string().min(1).optional(),
@@ -118,6 +120,9 @@ const EnvSchema = z.object({
 
   // optional
   MAX_TRANSCRIPT_CHARS: z.string().optional(),
+  MAX_REPORT_CHARS: z.string().optional(),
+  REPORT_TERMS_MAX: z.string().optional(),
+  REPORT_LABS_MAX: z.string().optional(),
 
   // Safety/quality knobs
   OUTPUT_PII_MODE: z.enum(["redact", "block", "off"]).optional(), // default: redact
@@ -198,12 +203,115 @@ const DiarySummarySchema = z.object({
   trust: TrustSchema.optional(),
 });
 
+// ---------------- Report Interpreter schemas ----------------
+const ReportTypeHintSchema = z.enum(["labs", "imaging", "discharge", "other"]).optional();
+
+const SourceLinkSchema = z.object({
+  label: z.string().min(1),
+  url: z.string().url(),
+});
+
+const EvidenceSpanSchema = z.object({
+  start: z.number().int().nonnegative(),
+  end: z.number().int().nonnegative(),
+  snippet: z.string().min(1),
+});
+
+const ReportTermSchema = z.object({
+  term: z.string().min(1),
+  normalized: z.string().optional(),
+  translation: z.string().optional(),
+  category: z.string().optional(),
+  offset: z.number().int().nonnegative().optional(),
+  length: z.number().int().nonnegative().optional(),
+  explanation: z.string().optional(), // minimal
+  typicalContext: z.string().optional(), // labs / imaging / diagnosis
+  whyItMatters: z.string().optional(), // one short sentence
+  sources: z.array(SourceLinkSchema).optional(),
+});
+
+const LabReferenceRangeSchema = z.object({
+  low: z.number().nullable().optional(),
+  high: z.number().nullable().optional(),
+  text: z.string().optional(), // raw range text if present
+  note: z.string().optional(), // caveats (age/sex/lab specific)
+  source: z.string().url().optional(), // optional link
+});
+
+const LabValueSchema = z.object({
+  name: z.string().min(1),
+  nameNormalized: z.string().optional(),
+  value: z.number().nullable().optional(),
+  valueText: z.string().optional(), // for non-numeric values
+  unit: z.string().optional(),
+  flag: z.enum(["low", "normal", "high", "unknown"]).optional(),
+  referenceRange: LabReferenceRangeSchema.optional(),
+  evidence: EvidenceSpanSchema.optional(),
+});
+
+const ReportSectionSchema = z.object({
+  title: z.string().min(1),
+  start: z.number().int().nonnegative(),
+  end: z.number().int().nonnegative(),
+  snippet: z.string().min(1),
+});
+
+const ReportIngestResponseSchema = z.object({
+  cleanedText: z.string().min(1),
+  reportType: z.enum(["labs", "imaging", "discharge", "other"]),
+  sections: z.array(ReportSectionSchema).default([]),
+  terms: z.array(ReportTermSchema).default([]),
+  labs: z.array(LabValueSchema).default([]),
+  warnings: z.array(z.string()).optional(),
+  trust: TrustSchema.optional(),
+});
+
+const ReportAnalyzeResponseSchema = z.object({
+  clinicianSummary: z.object({
+    abnormalFindings: z.array(z.string()).default([]),
+    hypotheses: z.array(
+      z.object({
+        text: z.string().min(1),
+        confidence: z.enum(["low", "medium", "high"]).default("low"),
+        evidence: z.array(EvidenceSpanSchema).optional(),
+      })
+    ).default([]),
+    nextSteps: z.array(z.string()).default([]),
+    redFlags: z.array(z.string()).default([]),
+    disclaimer: z.string().optional(),
+  }),
+  patientPlan: z.object({
+    plainEnglish: z.array(z.string()).default([]),
+    goalsToWatch: z.array(z.string()).default([]),
+    actions: z.array(z.string()).default([]),
+    whenToContactClinician: z.array(z.string()).default([]),
+    disclaimer: z.string().optional(),
+  }),
+  derived: z.object({
+    abnormalLabs: z.array(
+      z.object({
+        name: z.string(),
+        valueText: z.string().optional(),
+        unit: z.string().optional(),
+        flag: z.enum(["low", "normal", "high", "unknown"]),
+      })
+    ).default([]),
+  }),
+  warnings: z.array(z.string()).optional(),
+  trust: TrustSchema.optional(),
+});
+
 type Soap = z.infer<typeof SoapSchema>;
 type EvidenceLink = z.infer<typeof EvidenceLinkSchema>;
 type Segment = z.infer<typeof SegmentSchema>;
 type DiaryEntry = z.infer<typeof DiaryEntrySchema>;
 type DiarySummary = z.infer<typeof DiarySummarySchema>;
 type DiaryEvidenceItem = z.infer<typeof DiaryEvidenceItemSchema>;
+
+type ReportTerm = z.infer<typeof ReportTermSchema>;
+type LabValue = z.infer<typeof LabValueSchema>;
+type ReportIngestResponse = z.infer<typeof ReportIngestResponseSchema>;
+type ReportAnalyzeResponse = z.infer<typeof ReportAnalyzeResponseSchema>;
 
 // ---------------- helpers ----------------
 const env = EnvSchema.safeParse(process.env);
@@ -216,6 +324,10 @@ if (!env.success) {
 }
 
 const MAX_TRANSCRIPT_CHARS = Number(process.env.MAX_TRANSCRIPT_CHARS ?? 50_000);
+const MAX_REPORT_CHARS = Number(process.env.MAX_REPORT_CHARS ?? 120_000);
+const REPORT_TERMS_MAX = Math.max(1, Math.min(80, Number(process.env.REPORT_TERMS_MAX ?? 20)));
+const REPORT_LABS_MAX = Math.max(1, Math.min(200, Number(process.env.REPORT_LABS_MAX ?? 60)));
+
 const OUTPUT_PII_MODE = (process.env.OUTPUT_PII_MODE ?? "redact") as "redact" | "block" | "off";
 const DEFAULT_ENFORCE_REDACTION = (process.env.DEFAULT_ENFORCE_REDACTION ?? "false") === "true";
 const DIARY_SUMMARY_MAX_ENTRIES = Math.max(1, Math.min(365, Number(process.env.DIARY_SUMMARY_MAX_ENTRIES ?? 30)));
@@ -284,6 +396,15 @@ function truncateNote(note: string, maxChars: number) {
   if (!maxChars) return "";
   if (t.length <= maxChars) return t;
   return t.slice(0, maxChars) + "…";
+}
+
+function normalizeKey(s: string) {
+  return String(s ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s\/%μµ.-]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function mockSoap(transcript: string) {
@@ -580,13 +701,13 @@ async function redactStringsBestEffort<T extends Record<string, any>>(
   return { redacted, piiDetected };
 }
 
-async function extractHealthcareEntitiesBestEffort(transcript: string) {
+async function extractHealthcareEntitiesBestEffort(text: string) {
   const ta = makeTextAnalytics();
   if (!ta) return null;
 
   // If the resource doesn't have the healthcare feature enabled, this can throw.
   try {
-    const poller = await ta.beginAnalyzeHealthcareEntities([transcript]);
+    const poller = await ta.beginAnalyzeHealthcareEntities([text]);
     const results = await poller.pollUntilDone();
 
     const out: Array<{
@@ -611,7 +732,7 @@ async function extractHealthcareEntitiesBestEffort(transcript: string) {
         });
       }
     }
-    return out.slice(0, 200);
+    return out.slice(0, 250);
   } catch {
     return null;
   }
@@ -625,6 +746,7 @@ function asyncHandler<TReq extends Request, TRes extends Response>(
   };
 }
 
+// ---------------- Diary helpers ----------------
 function normalizeDiary(diary: DiaryEntry[]) {
   return diary
     .slice()
@@ -708,7 +830,8 @@ function deterministicDiarySummary(diary: ReturnType<typeof normalizeDiary>): Di
   const redFlags: string[] = [];
   // gentle, non-diagnostic heuristics
   const mostRecent = last7[last7.length - 1];
-  if (mostRecent && mostRecent.symptomScore >= 8) redFlags.push("Very high symptom score recently (consider timely check-in).");
+  if (mostRecent && mostRecent.symptomScore >= 8)
+    redFlags.push("Very high symptom score recently (consider timely check-in).");
   if (avgSleep != null && avgSleep < 5) redFlags.push("Low average sleep over the last week.");
 
   const questions: string[] = [];
@@ -811,10 +934,703 @@ Return the JSON schema exactly.`;
     gentleSuggestions: candidate.data.gentleSuggestions.map((x) => String(x).trim()).filter(Boolean).slice(0, 5),
     last7DaysAvgSymptom: candidate.data.last7DaysAvgSymptom ?? null,
     redFlags: candidate.data.redFlags.map((x) => String(x).trim()).filter(Boolean).slice(0, 5),
-    questionsForClinician: candidate.data.questionsForClinician.map((x) => String(x).trim()).filter(Boolean).slice(0, 5),
+    questionsForClinician: candidate.data.questionsForClinician
+      .map((x) => String(x).trim())
+      .filter(Boolean)
+      .slice(0, 5),
   };
 
   return s;
+}
+
+// ---------------- Report Interpreter helpers ----------------
+
+// Curated, safe “learn more” links (no network calls; just references)
+function buildTrustedLinks(term: string, context: "labs" | "imaging" | "discharge" | "other") {
+  const q = encodeURIComponent(term);
+  const links: Array<{ label: string; url: string }> = [
+    { label: "MedlinePlus (NLM)", url: `https://medlineplus.gov/search.html?query=${q}` },
+  ];
+
+  if (context === "labs") {
+    links.unshift({ label: "MedlinePlus Lab Tests", url: `https://medlineplus.gov/lab-tests/` });
+  }
+  if (context === "imaging") {
+    links.unshift({ label: "RadiologyInfo.org (ACR/RSNA)", url: `https://www.radiologyinfo.org/en/info.cfm?pg=search&search=${q}` });
+  }
+
+  return links;
+}
+
+// Common Latin/medical phrases: fast “tap-to-explain” without calling the LLM.
+const LATIN_TERM_MAP: Record<
+  string,
+  { translation: string; explanation: string; typicalContext: string; whyItMatters: string }
+> = {
+  "status post": {
+    translation: "after (a procedure/event)",
+    explanation: "Indicates a past surgery, injury, or medical event already happened.",
+    typicalContext: "history / diagnosis",
+    whyItMatters: "Past events can change what findings mean today.",
+  },
+  "s/p": {
+    translation: "after (a procedure/event)",
+    explanation: "Short form of 'status post'—something occurred in the past.",
+    typicalContext: "history / diagnosis",
+    whyItMatters: "Signals prior interventions that may explain current findings.",
+  },
+  "fractura": {
+    translation: "fracture",
+    explanation: "A break in a bone.",
+    typicalContext: "imaging",
+    whyItMatters: "May require immobilization or follow-up imaging depending on severity.",
+  },
+  "stenosis": {
+    translation: "narrowing",
+    explanation: "A narrowed area (often a blood vessel, valve, or spinal canal).",
+    typicalContext: "imaging",
+    whyItMatters: "Narrowing can reduce flow or compress structures, depending on location.",
+  },
+  "benignus": {
+    translation: "benign (non-cancerous)",
+    explanation: "Describes a finding that is not cancer.",
+    typicalContext: "pathology / imaging",
+    whyItMatters: "Usually changes urgency and follow-up compared to malignant findings.",
+  },
+  "malignus": {
+    translation: "malignant (cancerous)",
+    explanation: "Describes a cancerous finding.",
+    typicalContext: "pathology / imaging",
+    whyItMatters: "Often requires specialist follow-up and further work-up.",
+  },
+  "in situ": {
+    translation: "in place",
+    explanation: "Describes something located where it normally originates.",
+    typicalContext: "pathology",
+    whyItMatters: "May affect staging and treatment decisions (clinician-led).",
+  },
+};
+
+function findAllOccurrences(haystack: string, needle: string) {
+  const out: Array<{ start: number; end: number }> = [];
+  const h = haystack.toLowerCase();
+  const n = needle.toLowerCase();
+  let idx = 0;
+  while (idx >= 0) {
+    idx = h.indexOf(n, idx);
+    if (idx < 0) break;
+    out.push({ start: idx, end: idx + n.length });
+    idx = idx + n.length;
+  }
+  return out;
+}
+
+function splitReportSections(text: string): Array<{ title: string; start: number; end: number; snippet: string }> {
+  const t = text;
+  const lines = t.split(/\r?\n/);
+
+  // Heuristic headings: ALL CAPS or ends with ":" and short
+  const headingRe = /^[A-Z][A-Z0-9\s\/()-]{2,60}:?$/;
+  const candidates: Array<{ title: string; charIndex: number }> = [];
+
+  let charPos = 0;
+  for (const line of lines) {
+    const raw = line;
+    const trimmed = raw.trim();
+    const isHeading = trimmed.length >= 3 && trimmed.length <= 60 && headingRe.test(trimmed.replace(/:+$/, ""));
+    if (isHeading) {
+      candidates.push({ title: trimmed.replace(/:+$/, ""), charIndex: charPos });
+    }
+    charPos += raw.length + 1; // + newline
+  }
+
+  if (!candidates.length) {
+    return [
+      {
+        title: "Report",
+        start: 0,
+        end: Math.min(t.length, 800),
+        snippet: t.slice(0, Math.min(t.length, 800)).trim() || "Report",
+      },
+    ];
+  }
+
+  const out: Array<{ title: string; start: number; end: number; snippet: string }> = [];
+  for (let i = 0; i < candidates.length; i++) {
+    const cur = candidates[i];
+    const next = candidates[i + 1];
+    const start = cur.charIndex;
+    const end = next ? next.charIndex : t.length;
+    const snippet = t.slice(start, Math.min(end, start + 900)).trim();
+    out.push({
+      title: cur.title,
+      start,
+      end,
+      snippet: snippet || cur.title,
+    });
+  }
+  return out.slice(0, 12);
+}
+
+type RangeInfo = { low?: number | null; high?: number | null; unit?: string; note?: string };
+
+// “Typical adult” reference ranges (demo-safe; not lab-specific)
+const TYPICAL_LAB_RANGES: Record<string, RangeInfo> = {
+  // Metabolic / glucose
+  glucose: { low: 70, high: 99, unit: "mg/dL", note: "Typical fasting reference range; varies by lab and context." },
+  hba1c: { low: 4.0, high: 5.6, unit: "%", note: "Typical non-diabetic range; targets vary by clinical context." },
+
+  // Lipids
+  ldl: { low: null, high: 100, unit: "mg/dL", note: "Targets depend on cardiovascular risk; clinician-guided." },
+  hdl: { low: 40, high: null, unit: "mg/dL", note: "Higher is generally better; ranges vary by sex and lab." },
+  triglycerides: { low: null, high: 150, unit: "mg/dL", note: "Fasting status affects results." },
+  total cholesterol: { low: null, high: 200, unit: "mg/dL", note: "Interpretation depends on overall risk profile." },
+
+  // Inflammation
+  crp: { low: 0, high: 10, unit: "mg/L", note: "Many labs use different cutoffs; clinical context matters." },
+
+  // Thyroid
+  tsh: { low: 0.4, high: 4.0, unit: "mIU/L", note: "Ranges vary by lab, age, pregnancy status." },
+
+  // Liver
+  alt: { low: 7, high: 56, unit: "U/L", note: "Ranges vary by lab and sex." },
+  ast: { low: 10, high: 40, unit: "U/L", note: "Ranges vary by lab and sex." },
+
+  // Kidney
+  creatinine: { low: 0.6, high: 1.3, unit: "mg/dL", note: "Ranges vary by sex/muscle mass; eGFR preferred clinically." },
+
+  // Blood count
+  hemoglobin: { low: 12.0, high: 17.5, unit: "g/dL", note: "Ranges vary by sex, altitude, lab." },
+  wbc: { low: 4.0, high: 11.0, unit: "×10^9/L", note: "Typical adult range; varies by lab." },
+  platelets: { low: 150, high: 450, unit: "×10^9/L", note: "Typical adult range; varies by lab." },
+};
+
+function normalizeLabName(name: string) {
+  const k = normalizeKey(name);
+  // common aliases
+  if (k.includes("hb a1c") || k.includes("hba1c") || k.includes("glycated hemoglobin")) return "hba1c";
+  if (k === "ldl" || k.includes("ldl cholesterol")) return "ldl";
+  if (k === "hdl" || k.includes("hdl cholesterol")) return "hdl";
+  if (k.includes("triglycer")) return "triglycerides";
+  if (k.includes("total cholesterol") || k === "cholesterol") return "total cholesterol";
+  if (k === "crp" || k.includes("c-reactive")) return "crp";
+  if (k === "tsh" || k.includes("thyroid stimulating")) return "tsh";
+  if (k === "alt" || k.includes("alanine aminotransferase")) return "alt";
+  if (k === "ast" || k.includes("aspartate aminotransferase")) return "ast";
+  if (k.includes("creatinine")) return "creatinine";
+  if (k.includes("hemoglobin") || k === "hgb" || k === "hb") return "hemoglobin";
+  if (k === "wbc" || k.includes("white blood")) return "wbc";
+  if (k.includes("platelet") || k === "plt") return "platelets";
+  if (k.includes("glucose")) return "glucose";
+  return k;
+}
+
+function computeLabFlag(value: number | null | undefined, range?: RangeInfo) {
+  if (value == null || !range) return "unknown" as const;
+  const lo = typeof range.low === "number" ? range.low : null;
+  const hi = typeof range.high === "number" ? range.high : null;
+  if (lo != null && value < lo) return "low" as const;
+  if (hi != null && value > hi) return "high" as const;
+  if (lo != null || hi != null) return "normal" as const;
+  return "unknown" as const;
+}
+
+function extractLabsFromText(text: string, max: number): LabValue[] {
+  const out: LabValue[] = [];
+
+  // Split lines, but also catch inline “Name: value unit (range)”
+  const lines = text.split(/\r?\n/);
+  let charPos = 0;
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    const start = charPos;
+    const end = start + rawLine.length;
+    charPos += rawLine.length + 1;
+
+    if (!line) continue;
+    if (line.length > 180) continue; // skip long narrative lines
+
+    // Find first number-ish occurrence
+    const numMatch = line.match(/([<>]?\s*-?\d+(?:\.\d+)?)/);
+    if (!numMatch) continue;
+
+    const numStr = numMatch[1].replace(/\s+/g, "");
+    const value = Number(numStr.replace(/[<>]/g, ""));
+    const valueIsNumber = Number.isFinite(value);
+
+    // Name = left side before first number
+    const idx = numMatch.index ?? -1;
+    if (idx < 1) continue;
+    let name = line.slice(0, idx).replace(/[:=]+$/, "").trim();
+    name = name.replace(/\s{2,}/g, " ");
+    if (name.length < 2) continue;
+
+    // Unit = token right after the number (letters, %, /, μ/µ)
+    const after = line.slice(idx + numMatch[0].length).trim();
+    const unitMatch = after.match(/^([a-zA-Z/%μµ×\^0-9.\-]+)\b/);
+    const unit = unitMatch?.[1];
+
+    // Range: (low - high) or "ref: low-high"
+    let low: number | null | undefined = undefined;
+    let high: number | null | undefined = undefined;
+    let rangeText: string | undefined;
+
+    const parenRange = line.match(/\(([^)]+)\)/);
+    if (parenRange?.[1]) {
+      rangeText = parenRange[1].trim();
+      const m = rangeText.match(/(-?\d+(?:\.\d+)?)\s*[-–]\s*(-?\d+(?:\.\d+)?)/);
+      if (m) {
+        const lo = Number(m[1]);
+        const hi = Number(m[2]);
+        if (Number.isFinite(lo)) low = lo;
+        if (Number.isFinite(hi)) high = hi;
+      }
+    } else {
+      const ref = line.match(/ref(?:erence)?\s*[:=]?\s*(-?\d+(?:\.\d+)?)\s*[-–]\s*(-?\d+(?:\.\d+)?)/i);
+      if (ref) {
+        rangeText = ref[0];
+        const lo = Number(ref[1]);
+        const hi = Number(ref[2]);
+        if (Number.isFinite(lo)) low = lo;
+        if (Number.isFinite(hi)) high = hi;
+      }
+    }
+
+    const nameNormalized = normalizeLabName(name);
+    const typical = TYPICAL_LAB_RANGES[nameNormalized];
+
+    // If report didn't include a range, attach a typical range (demo-safe) when known
+    const range: RangeInfo | undefined =
+      low != null || high != null
+        ? { low, high, unit: unit ?? typical?.unit, note: "Reference range from report (may be lab-specific)." }
+        : typical
+          ? typical
+          : undefined;
+
+    const flag = valueIsNumber ? computeLabFlag(value, range) : ("unknown" as const);
+
+    out.push({
+      name,
+      nameNormalized,
+      value: valueIsNumber ? value : null,
+      valueText: valueIsNumber ? undefined : numStr,
+      unit: unit ?? range?.unit,
+      flag,
+      referenceRange: range
+        ? {
+            low: range.low ?? null,
+            high: range.high ?? null,
+            text: rangeText,
+            note: range.note,
+            source:
+              nameNormalized && TYPICAL_LAB_RANGES[nameNormalized] && !(low != null || high != null)
+                ? "https://medlineplus.gov/lab-tests/"
+                : undefined,
+          }
+        : undefined,
+      evidence: {
+        start,
+        end: Math.min(text.length, end),
+        snippet: text.slice(start, Math.min(text.length, end)).trim() || line,
+      },
+    });
+
+    if (out.length >= max) break;
+  }
+
+  // De-duplicate by normalized key + keep first occurrence
+  const seen = new Set<string>();
+  const uniq: LabValue[] = [];
+  for (const x of out) {
+    const k = `${x.nameNormalized ?? normalizeLabName(x.name)}|${x.unit ?? ""}`;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    uniq.push(x);
+  }
+  return uniq.slice(0, max);
+}
+
+function guessReportType(text: string, hint?: z.infer<typeof ReportTypeHintSchema>) {
+  if (hint) return hint;
+
+  const t = text.toLowerCase();
+  const looksLikeLabs =
+    /\b(hba1c|glucose|cholesterol|ldl|hdl|triglycer|tsh|crp|hemoglobin|wbc|platelet|creatinine|alt|ast)\b/i.test(
+      text
+    ) || /\b(reference range|ref range|units|mg\/dl|mmol\/l|u\/l)\b/i.test(t);
+
+  const looksLikeImaging =
+    /\b(impression|findings|contrast|ct|mri|ultrasound|x-?ray|radiograph|lesion|mass|fracture|stenosis)\b/i.test(t);
+
+  if (looksLikeLabs && !looksLikeImaging) return "labs";
+  if (looksLikeImaging && !looksLikeLabs) return "imaging";
+  if (looksLikeLabs && looksLikeImaging) return "other";
+  if (/\bdischarge\b|\bsummary\b|\bmedications?\b|\bfollow-?up\b/i.test(t)) return "discharge";
+  return "other";
+}
+
+async function buildTermsForReport(
+  text: string,
+  reportType: "labs" | "imaging" | "discharge" | "other",
+  azure: ReturnType<typeof makeAzureOpenAI>
+): Promise<{ terms: ReportTerm[]; warnings: string[] }> {
+  const warnings: string[] = [];
+  const terms: ReportTerm[] = [];
+
+  // 1) Fast Latin/common phrase detection
+  const latinKeys = Object.keys(LATIN_TERM_MAP);
+  for (const k of latinKeys) {
+    const occ = findAllOccurrences(text, k);
+    for (const o of occ.slice(0, 3)) {
+      const meta = LATIN_TERM_MAP[k];
+      terms.push({
+        term: text.slice(o.start, o.end),
+        normalized: k,
+        translation: meta.translation,
+        category: "MedicalTerm",
+        offset: o.start,
+        length: o.end - o.start,
+        explanation: meta.explanation,
+        typicalContext: meta.typicalContext,
+        whyItMatters: meta.whyItMatters,
+        sources: buildTrustedLinks(k, reportType).slice(0, 2),
+      });
+    }
+  }
+
+  // 2) Azure Text Analytics for Health entities (best effort)
+  const entities = await extractHealthcareEntitiesBestEffort(truncateForProcessing(text, 20_000));
+  if (!entities) warnings.push("Healthcare entity extraction unavailable or not configured.");
+
+  if (entities?.length) {
+    for (const ent of entities.slice(0, REPORT_TERMS_MAX * 3)) {
+      const raw = String(ent.text ?? "").trim();
+      if (!raw) continue;
+      const norm = normalizeKey(raw);
+      if (!norm || norm.length < 3) continue;
+
+      // Keep only some categories for patient-facing “tap-to-explain”
+      const cat = String(ent.category ?? "");
+      const keep =
+        cat === "Diagnosis" ||
+        cat === "SymptomOrSign" ||
+        cat === "MedicationName" ||
+        cat === "TreatmentName" ||
+        cat === "ExaminationName" ||
+        cat === "ProcedureName" ||
+        cat === "BodyStructure" ||
+        cat === "ConditionQualifier" ||
+        cat === "Age" ||
+        cat === "LabTestName";
+
+      if (!keep) continue;
+
+      terms.push({
+        term: raw,
+        normalized: norm,
+        category: cat,
+        offset: typeof ent.offset === "number" ? ent.offset : undefined,
+        length: typeof ent.length === "number" ? ent.length : undefined,
+        sources: buildTrustedLinks(raw, reportType).slice(0, 2),
+      });
+    }
+  }
+
+  // De-dup by normalized + keep most informative
+  const uniq = new Map<string, ReportTerm>();
+  for (const t of terms) {
+    const key = t.normalized ?? normalizeKey(t.term);
+    const prev = uniq.get(key);
+    if (!prev) {
+      uniq.set(key, t);
+      continue;
+    }
+    // prefer the one that already has an explanation
+    const prevHas = Boolean(prev.explanation);
+    const curHas = Boolean(t.explanation);
+    if (!prevHas && curHas) uniq.set(key, t);
+  }
+
+  const picked = Array.from(uniq.values()).slice(0, REPORT_TERMS_MAX);
+
+  // 3) LLM: fill missing explanation/whyItMatters minimally (best effort)
+  if (!azure) {
+    // no LLM; return what we have (latin already explained)
+    if (!picked.length) warnings.push("No terms detected (or report too short).");
+    return { terms: picked, warnings };
+  }
+
+  const need = picked.filter((x) => !x.explanation).slice(0, Math.min(12, REPORT_TERMS_MAX));
+  if (!need.length) return { terms: picked, warnings };
+
+  try {
+    const deployment = process.env.AZURE_OPENAI_REPORT_DEPLOYMENT || azure.deployment;
+
+    const system = `You explain medical terms to patients WITHOUT changing medical meaning.
+Return STRICT JSON only (no markdown, no extra keys).
+You MUST be cautious and non-diagnostic. Do not invent patient-specific facts.
+For each term:
+- explanation: minimal, clear (<= 18 words)
+- typicalContext: one of: "lab", "imaging", "diagnosis", "treatment", "general"
+- whyItMatters: one short sentence (<= 20 words), informational.
+No PHI. No treatment advice.`;
+
+    const user = `Context: reportType=${reportType}.
+Terms (array):
+${JSON.stringify(need.map((t) => ({ term: t.term, category: t.category ?? "" })))}.
+Return:
+{
+  "items":[
+    { "term": string, "explanation": string, "typicalContext": string, "whyItMatters": string }
+  ]
+}`;
+
+    const completion = await azure.client.chat.completions.create({
+      model: deployment,
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: user },
+      ],
+      temperature: 0.2,
+      response_format: { type: "json_object" },
+    });
+
+    const content = completion.choices[0]?.message?.content ?? "{}";
+    const parsed = safeJsonParse(content);
+
+    const RespSchema = z.object({
+      items: z
+        .array(
+          z.object({
+            term: z.string().min(1),
+            explanation: z.string().min(1),
+            typicalContext: z.string().min(1),
+            whyItMatters: z.string().min(1),
+          })
+        )
+        .default([]),
+    });
+
+    const resp = RespSchema.safeParse(parsed);
+    if (!resp.success) {
+      warnings.push("Term explainer returned unexpected format; keeping partial terms.");
+      return { terms: picked, warnings };
+    }
+
+    const byTerm = new Map(resp.data.items.map((i) => [normalizeKey(i.term), i]));
+    const enriched = picked.map((t) => {
+      if (t.explanation) return t;
+      const x = byTerm.get(normalizeKey(t.term)) ?? byTerm.get(t.normalized ?? "");
+      if (!x) return t;
+      return {
+        ...t,
+        explanation: x.explanation,
+        typicalContext: x.typicalContext,
+        whyItMatters: x.whyItMatters,
+      };
+    });
+
+    return { terms: enriched, warnings };
+  } catch {
+    warnings.push("Term explainer failed; keeping partial terms.");
+    return { terms: picked, warnings };
+  }
+}
+
+function formatLabLine(l: LabValue) {
+  const v = l.value != null ? String(l.value) : (l.valueText ?? "");
+  const u = l.unit ? ` ${l.unit}` : "";
+  const f = l.flag ? ` (${l.flag})` : "";
+  return `${l.name}: ${v}${u}${f}`.trim();
+}
+
+async function llmAnalyzeReport(
+  text: string,
+  reportType: "labs" | "imaging" | "discharge" | "other",
+  labs: LabValue[],
+  azure: ReturnType<typeof makeAzureOpenAI>
+): Promise<{ result: ReportAnalyzeResponse | null; warnings: string[] }> {
+  const warnings: string[] = [];
+  if (!azure) return { result: null, warnings: ["Azure OpenAI not configured; using deterministic analysis."] };
+
+  const deployment = process.env.AZURE_OPENAI_REPORT_DEPLOYMENT || azure.deployment;
+
+  // Keep prompts short; never include PHI; assume synthetic/anonymized input
+  const labsCompact = labs.slice(0, 40).map((l) => ({
+    name: l.name,
+    value: l.value ?? null,
+    valueText: l.valueText ?? "",
+    unit: l.unit ?? "",
+    flag: l.flag ?? "unknown",
+    referenceRange: l.referenceRange ? { low: l.referenceRange.low ?? null, high: l.referenceRange.high ?? null } : null,
+  }));
+
+  const system = `You are a clinical assistant generating TWO outputs:
+1) Physician support summary (clinical-style)
+2) Patient-friendly plan (plain language)
+Return STRICT JSON only (no markdown, no extra keys).
+
+Critical rules:
+- DO NOT diagnose; use cautious language and "for clinician review".
+- Do not add new facts beyond the input.
+- No PHI. No medication dosing. No emergency instructions beyond generic "seek urgent care if severe symptoms".
+
+Schema:
+{
+  "clinicianSummary": {
+    "abnormalFindings": string[],
+    "hypotheses": [{"text": string, "confidence": "low"|"medium"|"high"}],
+    "nextSteps": string[],
+    "redFlags": string[],
+    "disclaimer": string
+  },
+  "patientPlan": {
+    "plainEnglish": string[],
+    "goalsToWatch": string[],
+    "actions": string[],
+    "whenToContactClinician": string[],
+    "disclaimer": string
+  }
+}`;
+
+  const user = `Report type: ${reportType}
+Report text (truncated):
+${truncateForProcessing(text, 7000)}
+
+Extracted labs (truncated):
+${JSON.stringify(labsCompact)}
+
+Make the outputs short and useful. Prefer: abnormal list, what to ask next, what to track.`;
+
+  try {
+    const completion = await azure.client.chat.completions.create({
+      model: deployment,
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: user },
+      ],
+      temperature: 0.2,
+      response_format: { type: "json_object" },
+    });
+
+    const content = completion.choices[0]?.message?.content ?? "{}";
+    const parsed = safeJsonParse(content);
+
+    const CandidateSchema = z.object({
+      clinicianSummary: z.object({
+        abnormalFindings: z.array(z.string()).default([]),
+        hypotheses: z
+          .array(z.object({ text: z.string().min(1), confidence: z.enum(["low", "medium", "high"]).default("low") }))
+          .default([]),
+        nextSteps: z.array(z.string()).default([]),
+        redFlags: z.array(z.string()).default([]),
+        disclaimer: z.string().default("Informational only — clinician review required."),
+      }),
+      patientPlan: z.object({
+        plainEnglish: z.array(z.string()).default([]),
+        goalsToWatch: z.array(z.string()).default([]),
+        actions: z.array(z.string()).default([]),
+        whenToContactClinician: z.array(z.string()).default([]),
+        disclaimer: z.string().default("Informational only — not medical advice."),
+      }),
+    });
+
+    const cand = CandidateSchema.safeParse(parsed);
+    if (!cand.success) {
+      warnings.push("Report analysis returned unexpected format; using deterministic analysis.");
+      return { result: null, warnings };
+    }
+
+    // Wrap into our full response shape (derived/trust filled elsewhere)
+    const result: ReportAnalyzeResponse = {
+      clinicianSummary: {
+        abnormalFindings: cand.data.clinicianSummary.abnormalFindings.slice(0, 12),
+        hypotheses: cand.data.clinicianSummary.hypotheses.slice(0, 8),
+        nextSteps: cand.data.clinicianSummary.nextSteps.slice(0, 10),
+        redFlags: cand.data.clinicianSummary.redFlags.slice(0, 8),
+        disclaimer: cand.data.clinicianSummary.disclaimer,
+      },
+      patientPlan: {
+        plainEnglish: cand.data.patientPlan.plainEnglish.slice(0, 10),
+        goalsToWatch: cand.data.patientPlan.goalsToWatch.slice(0, 8),
+        actions: cand.data.patientPlan.actions.slice(0, 10),
+        whenToContactClinician: cand.data.patientPlan.whenToContactClinician.slice(0, 8),
+        disclaimer: cand.data.patientPlan.disclaimer,
+      },
+      derived: { abnormalLabs: [] },
+      warnings: warnings.length ? warnings : undefined,
+    };
+
+    return { result, warnings };
+  } catch {
+    warnings.push("Report analysis failed; using deterministic analysis.");
+    return { result: null, warnings };
+  }
+}
+
+function deterministicReportAnalysis(
+  reportType: "labs" | "imaging" | "discharge" | "other",
+  labs: LabValue[]
+): ReportAnalyzeResponse {
+  const abnormal = labs
+    .filter((l) => (l.flag ?? "unknown") === "high" || (l.flag ?? "unknown") === "low")
+    .slice(0, 12);
+
+  const abnormalLines = abnormal.map(formatLabLine);
+
+  return {
+    clinicianSummary: {
+      abnormalFindings: abnormalLines.length
+        ? abnormalLines
+        : ["No clearly out-of-range numeric lab values detected (or report contains non-lab findings)."],
+      hypotheses: abnormalLines.length
+        ? [
+            { text: "Abnormal values may reflect multiple causes; interpret with symptoms/history.", confidence: "low" },
+          ]
+        : [{ text: "Consider clinical context; imaging/discharge reports often need clinician interpretation.", confidence: "low" }],
+      nextSteps: [
+        "Review report in full and correlate with symptoms, history, and medications.",
+        "If values are unexpected, consider repeat testing or confirm units/reference ranges.",
+        "Discuss with clinician any persistent abnormalities or worsening trends.",
+      ],
+      redFlags: [
+        "If severe or rapidly worsening symptoms occur, seek urgent medical evaluation.",
+        "If report states 'urgent'/'critical'/'call physician immediately', follow that guidance.",
+      ],
+      disclaimer: "Informational only — clinician review required.",
+    },
+    patientPlan: {
+      plainEnglish: abnormalLines.length
+        ? [
+            "Some results are outside typical ranges. This can happen for many reasons.",
+            "The meaning depends on symptoms, medical history, and how the test was done.",
+          ]
+        : ["This report may not include numeric labs, or values may be within typical ranges."],
+      goalsToWatch: abnormalLines.length
+        ? abnormal.slice(0, 6).map((l) => `Track ${l.name} toward the reference range (clinician-guided).`)
+        : ["Ask your clinician which values matter most to track over time."],
+      actions: [
+        "Bring this report to your next appointment (or send it to your clinician).",
+        "Write down any symptoms and questions you want answered.",
+        "If you have multiple reports, compare trends over time.",
+      ],
+      whenToContactClinician: [
+        "If you feel worse, develop new concerning symptoms, or the report mentions urgent follow-up.",
+        "If you’re unsure what any flagged result means for you personally.",
+      ],
+      disclaimer: "Informational only — not medical advice.",
+    },
+    derived: {
+      abnormalLabs: abnormal.map((l) => ({
+        name: l.name,
+        valueText: l.value != null ? String(l.value) : l.valueText ?? "",
+        unit: l.unit,
+        flag: l.flag ?? "unknown",
+      })),
+    },
+    warnings: reportType === "imaging" ? ["Imaging reports often require clinician context; numbers may be absent."] : undefined,
+  };
 }
 
 // ---------------- routes ----------------
@@ -987,7 +1803,7 @@ Rules:
           : buildEvidenceFromSearch(transcript, soap);
 
     // 3) optional healthcare entities (Azure Text Analytics for Health)
-    const entities = await extractHealthcareEntitiesBestEffort(transcript);
+    const entities = await extractHealthcareEntitiesBestEffort(truncateForProcessing(transcript, 20_000));
     if (!entities) warnings.push("Healthcare entity extraction unavailable or not configured.");
 
     // 4) output safety gate (PII on response) – redact or block
@@ -1188,6 +2004,232 @@ app.post(
   })
 );
 
+/**
+ * Report Interpreter: POST /report/ingest
+ * Body:
+ *  {
+ *    text: string,
+ *    reportTypeHint?: "labs"|"imaging"|"discharge"|"other",
+ *    enforceRedaction?: boolean,
+ *    enforceOutputSafety?: boolean
+ *  }
+ *
+ * Returns:
+ *  { cleanedText, reportType, sections, terms, labs, warnings?, trust? }
+ */
+app.post(
+  "/report/ingest",
+  asyncHandler(async (req, res) => {
+    const Body = z.object({
+      text: z.string().min(1).max(400_000),
+      reportTypeHint: ReportTypeHintSchema,
+      enforceRedaction: z.boolean().optional(),
+      enforceOutputSafety: z.boolean().optional(),
+    });
+
+    const parsed = Body.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: "Invalid body" });
+
+    const enforceRedaction = parsed.data.enforceRedaction ?? DEFAULT_ENFORCE_REDACTION;
+    const enforceOutputSafety = parsed.data.enforceOutputSafety ?? true;
+
+    let text = String(parsed.data.text).replace(/\r\n/g, "\n").trim();
+    text = truncateForProcessing(text, MAX_REPORT_CHARS);
+
+    // no content logging
+    req.log.info({ route: "/report/ingest", textLen: text.length }, "report ingest");
+
+    // Optional input PHI gate (best effort)
+    let piiDetectedInput = false;
+    if (enforceRedaction) {
+      const { piiDetected } = await redactTextBestEffort(text.slice(0, 20_000));
+      piiDetectedInput = piiDetected;
+      if (piiDetected) {
+        return res.status(400).json({
+          error: "PII detected. Please redact before processing a report.",
+          code: "PII_DETECTED",
+        });
+      }
+    }
+
+    const reportType = guessReportType(text, parsed.data.reportTypeHint);
+    const sections = splitReportSections(text).map((s) => ({
+      title: s.title,
+      start: s.start,
+      end: s.end,
+      snippet: s.snippet,
+    }));
+
+    const labs = extractLabsFromText(text, REPORT_LABS_MAX);
+
+    const azure = makeAzureOpenAI();
+    const { terms, warnings } = await buildTermsForReport(text, reportType, azure);
+
+    // Evidence/trust: for ingest we treat terms and labs as “verified” if they have evidence spans/offsets
+    const evidenceLike = [
+      ...terms.map((t) => ({ verified: Boolean(typeof t.offset === "number") })),
+      ...labs.map((l) => ({ verified: Boolean(l.evidence) })),
+    ];
+    const trustCore = computeTrustFromEvidence(evidenceLike);
+
+    let payload: ReportIngestResponse = {
+      cleanedText: text,
+      reportType,
+      sections,
+      terms,
+      labs,
+      warnings: warnings.length ? warnings : undefined,
+      trust: {
+        scorePct: trustCore.scorePct,
+        verified: trustCore.verified,
+        unverified: trustCore.unverified,
+        piiDetectedInput,
+        mode: azure ? "llm" : "deterministic",
+      },
+    };
+
+    // Output safety gate (PII on response) – redact or block
+    if (enforceOutputSafety && OUTPUT_PII_MODE !== "off") {
+      const { redacted, piiDetected } = await redactStringsBestEffort(payload as any);
+      if (piiDetected && OUTPUT_PII_MODE === "block") {
+        return res.status(400).json({
+          error: "PII detected in output. Please adjust input and try again.",
+          code: "PII_DETECTED_OUTPUT",
+        });
+      }
+      payload = redacted as ReportIngestResponse;
+      payload.trust = {
+        ...(payload.trust ?? trustCore),
+        piiDetectedOutput: piiDetected,
+        piiDetectedInput,
+      };
+    }
+
+    const finalParsed = ReportIngestResponseSchema.safeParse(payload);
+    if (!finalParsed.success) return res.status(502).json({ error: "Report ingest schema mismatch" });
+
+    return res.json(finalParsed.data);
+  })
+);
+
+/**
+ * Report Interpreter: POST /report/analyze
+ * Body:
+ *  {
+ *    text: string,
+ *    reportTypeHint?: "labs"|"imaging"|"discharge"|"other",
+ *    labs?: LabValue[],                 // optional: from /report/ingest
+ *    enforceRedaction?: boolean,
+ *    enforceOutputSafety?: boolean
+ *  }
+ *
+ * Returns:
+ *  { clinicianSummary, patientPlan, derived, warnings?, trust? }
+ */
+app.post(
+  "/report/analyze",
+  asyncHandler(async (req, res) => {
+    const Body = z.object({
+      text: z.string().min(1).max(400_000),
+      reportTypeHint: ReportTypeHintSchema,
+      labs: z.array(LabValueSchema).optional(),
+      enforceRedaction: z.boolean().optional(),
+      enforceOutputSafety: z.boolean().optional(),
+    });
+
+    const parsed = Body.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: "Invalid body" });
+
+    const enforceRedaction = parsed.data.enforceRedaction ?? DEFAULT_ENFORCE_REDACTION;
+    const enforceOutputSafety = parsed.data.enforceOutputSafety ?? true;
+
+    let text = String(parsed.data.text).replace(/\r\n/g, "\n").trim();
+    text = truncateForProcessing(text, MAX_REPORT_CHARS);
+
+    // no content logging
+    req.log.info(
+      { route: "/report/analyze", textLen: text.length, labsProvided: Boolean(parsed.data.labs?.length) },
+      "report analyze"
+    );
+
+    // Optional input PHI gate (best effort)
+    let piiDetectedInput = false;
+    if (enforceRedaction) {
+      const { piiDetected } = await redactTextBestEffort(text.slice(0, 20_000));
+      piiDetectedInput = piiDetected;
+      if (piiDetected) {
+        return res.status(400).json({
+          error: "PII detected. Please redact before analyzing a report.",
+          code: "PII_DETECTED",
+        });
+      }
+    }
+
+    const reportType = guessReportType(text, parsed.data.reportTypeHint);
+    const labs = parsed.data.labs?.length ? parsed.data.labs.slice(0, REPORT_LABS_MAX) : extractLabsFromText(text, REPORT_LABS_MAX);
+
+    const azure = makeAzureOpenAI();
+    let warnings: string[] = [];
+
+    // LLM analysis (fallback deterministic)
+    const llm = await llmAnalyzeReport(text, reportType, labs, azure);
+    warnings.push(...llm.warnings);
+
+    const base: ReportAnalyzeResponse =
+      llm.result ??
+      deterministicReportAnalysis(reportType, labs);
+
+    // Derived: abnormal labs list
+    const abnormalLabs = labs
+      .filter((l) => (l.flag ?? "unknown") === "high" || (l.flag ?? "unknown") === "low")
+      .slice(0, 24)
+      .map((l) => ({
+        name: l.name,
+        valueText: l.value != null ? String(l.value) : l.valueText ?? "",
+        unit: l.unit,
+        flag: (l.flag ?? "unknown") as "low" | "normal" | "high" | "unknown",
+      }));
+
+    // Trust: treat “derived abnormal labs” as verified if they have evidence spans
+    const trustCore = computeTrustFromEvidence(labs.map((l) => ({ verified: Boolean(l.evidence) })));
+
+    let payload: ReportAnalyzeResponse = {
+      ...base,
+      derived: { abnormalLabs },
+      warnings: warnings.length ? Array.from(new Set(warnings)).slice(0, 10) : undefined,
+      trust: {
+        scorePct: trustCore.scorePct,
+        verified: trustCore.verified,
+        unverified: trustCore.unverified,
+        piiDetectedInput,
+        mode: azure ? "llm" : "deterministic",
+      },
+    };
+
+    // Output safety gate (PII on response) – redact or block
+    if (enforceOutputSafety && OUTPUT_PII_MODE !== "off") {
+      const { redacted, piiDetected } = await redactStringsBestEffort(payload as any);
+      if (piiDetected && OUTPUT_PII_MODE === "block") {
+        return res.status(400).json({
+          error: "PII detected in generated output. Please adjust input and try again.",
+          code: "PII_DETECTED_OUTPUT",
+        });
+      }
+      payload = redacted as ReportAnalyzeResponse;
+      payload.trust = {
+        ...(payload.trust ?? trustCore),
+        piiDetectedOutput: piiDetected,
+        piiDetectedInput,
+      };
+    }
+
+    const finalParsed = ReportAnalyzeResponseSchema.safeParse(payload);
+    if (!finalParsed.success) return res.status(502).json({ error: "Report analysis schema mismatch" });
+
+    return res.json(finalParsed.data);
+  })
+);
+
 // ---------------- error handler (sanitized) ----------------
 app.use((err: any, req: Request, res: Response, _next: NextFunction) => {
   const status = Number(err?.statusCode ?? err?.status ?? 500);
@@ -1214,12 +2256,17 @@ app.listen(port, () => {
   log.info(
     {
       port,
-      openai: Boolean(process.env.AZURE_OPENAI_ENDPOINT && process.env.AZURE_OPENAI_KEY && process.env.AZURE_OPENAI_DEPLOYMENT),
+      openai: Boolean(
+        process.env.AZURE_OPENAI_ENDPOINT && process.env.AZURE_OPENAI_KEY && process.env.AZURE_OPENAI_DEPLOYMENT
+      ),
       speech: Boolean(process.env.AZURE_SPEECH_KEY && process.env.AZURE_SPEECH_REGION),
       textAnalytics: Boolean(process.env.AZURE_LANGUAGE_ENDPOINT && process.env.AZURE_LANGUAGE_KEY),
       outputPiiMode: OUTPUT_PII_MODE,
       defaultEnforceRedaction: DEFAULT_ENFORCE_REDACTION,
       diaryMaxEntries: DIARY_SUMMARY_MAX_ENTRIES,
+      reportMaxChars: MAX_REPORT_CHARS,
+      reportTermsMax: REPORT_TERMS_MAX,
+      reportLabsMax: REPORT_LABS_MAX,
     },
     "careloop api listening"
   );
