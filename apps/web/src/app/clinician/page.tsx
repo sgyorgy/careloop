@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { z } from "zod";
 
 const LS_KEYS = {
@@ -51,9 +51,27 @@ const EntitySchema = z.object({
   length: z.number().optional(),
 });
 
+/**
+ * Forward-compatible: backend may later add e.g. quality/trust/pii flags.
+ * We accept them when present, but don’t require them.
+ */
 const SoapResponseSchema = SoapSchema.extend({
   entities: z.array(EntitySchema).nullable().optional(),
   warnings: z.array(z.string()).optional(),
+
+  // optional future fields (safe to ignore)
+  piiDetected: z.boolean().optional(),
+  redacted: z.boolean().optional(),
+  quality: z
+    .object({
+      trustScore: z.number().min(0).max(100).optional(),
+      evidenceVerified: z.number().int().nonnegative().optional(),
+      evidenceTotal: z.number().int().nonnegative().optional(),
+      timestampEvidence: z.number().int().nonnegative().optional(),
+      lineCoveragePct: z.number().min(0).max(100).optional(),
+    })
+    .partial()
+    .optional(),
 });
 
 type Segment = z.infer<typeof SegmentSchema>;
@@ -61,6 +79,17 @@ type Evidence = z.infer<typeof EvidenceSchema>;
 type SoapResponse = z.infer<typeof SoapResponseSchema>;
 
 // ---------------- utils ----------------
+function clamp(n: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, n));
+}
+
+function normalizeLine(s: string) {
+  return String(s ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+}
+
 function localRedact(text: string): string {
   let t = text;
 
@@ -118,6 +147,27 @@ function downloadJson(filename: string, obj: unknown) {
   URL.revokeObjectURL(url);
 }
 
+function downloadText(filename: string, text: string) {
+  const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+async function copyToClipboard(text: string) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function apiPost<T>(path: string, body: unknown): Promise<T> {
   const res = await fetch(`/api${path}`, {
     method: "POST",
@@ -126,7 +176,12 @@ async function apiPost<T>(path: string, body: unknown): Promise<T> {
   });
 
   const text = await res.text();
-  const json = text ? (JSON.parse(text) as any) : null;
+  let json: any = null;
+  try {
+    json = text ? JSON.parse(text) : null;
+  } catch {
+    json = null;
+  }
 
   if (!res.ok) {
     const msg = json?.error ? String(json.error) : `API ${path} failed: ${res.status}`;
@@ -143,7 +198,12 @@ async function apiPost<T>(path: string, body: unknown): Promise<T> {
 async function apiPostForm<T>(path: string, form: FormData): Promise<T> {
   const res = await fetch(`/api${path}`, { method: "POST", body: form });
   const text = await res.text();
-  const json = text ? (JSON.parse(text) as any) : null;
+  let json: any = null;
+  try {
+    json = text ? JSON.parse(text) : null;
+  } catch {
+    json = null;
+  }
 
   if (!res.ok) {
     const msg = json?.error ? String(json.error) : `API ${path} failed: ${res.status}`;
@@ -162,7 +222,6 @@ function bestSnippetFromEvidence(
   transcriptUsed: string,
   segmentsUsed: Segment[] | null
 ): { label: string; snippet: string; meta?: string } {
-  // If backend already provides snippet, prefer it
   if (ev.snippet && ev.snippet.trim()) {
     const meta =
       typeof ev.startMs === "number" && typeof ev.endMs === "number"
@@ -173,7 +232,6 @@ function bestSnippetFromEvidence(
     return { label: "Evidence", snippet: ev.snippet, meta };
   }
 
-  // Timestamp evidence: pick overlapping segments
   if (
     segmentsUsed?.length &&
     typeof ev.startMs === "number" &&
@@ -195,7 +253,6 @@ function bestSnippetFromEvidence(
     }
   }
 
-  // Char-span evidence
   if (
     typeof ev.start === "number" &&
     typeof ev.end === "number" &&
@@ -216,6 +273,78 @@ function bestSnippetFromEvidence(
   return { label: "Evidence", snippet: "" };
 }
 
+function soapToText(soap: Pick<SoapResponse, "subjective" | "objective" | "assessment" | "plan">) {
+  const S = asLines(soap.subjective);
+  const O = asLines(soap.objective);
+  const A = asLines(soap.assessment);
+  const P = asLines(soap.plan);
+
+  const parts = [
+    "SOAP NOTE",
+    "",
+    "SUBJECTIVE",
+    ...S.map((x) => `- ${x}`),
+    "",
+    "OBJECTIVE",
+    ...O.map((x) => `- ${x}`),
+    "",
+    "ASSESSMENT",
+    ...A.map((x) => `- ${x}`),
+    "",
+    "PLAN",
+    ...P.map((x) => `- ${x}`),
+    "",
+  ];
+
+  return parts.join("\n");
+}
+
+function buildFhirLiteBundle(soap: Pick<SoapResponse, "subjective" | "objective" | "assessment" | "plan">) {
+  const now = new Date().toISOString();
+  const text = soapToText(soap);
+
+  // “FHIR-lite”: looks like FHIR, but we avoid claiming strict FHIR correctness.
+  return {
+    resourceType: "Bundle",
+    type: "collection",
+    timestamp: now,
+    entry: [
+      {
+        resource: {
+          resourceType: "Composition",
+          status: "final",
+          type: { text: "Clinical note (SOAP)" },
+          date: now,
+          title: "SOAP Note (demo)",
+          section: [
+            { title: "Subjective", text: { status: "generated", div: asLines(soap.subjective).join("\n") } },
+            { title: "Objective", text: { status: "generated", div: asLines(soap.objective).join("\n") } },
+            { title: "Assessment", text: { status: "generated", div: asLines(soap.assessment).join("\n") } },
+            { title: "Plan", text: { status: "generated", div: asLines(soap.plan).join("\n") } },
+          ],
+        },
+      },
+      {
+        resource: {
+          resourceType: "DocumentReference",
+          status: "current",
+          date: now,
+          description: "Human-readable SOAP note (demo)",
+          content: [
+            {
+              attachment: {
+                contentType: "text/plain",
+                title: "soap.txt",
+                data: btoa(unescape(encodeURIComponent(text))),
+              },
+            },
+          ],
+        },
+      },
+    ],
+  };
+}
+
 // ---------------- component ----------------
 export default function ClinicianPage() {
   const [transcript, setTranscript] = useState("");
@@ -227,23 +356,35 @@ export default function ClinicianPage() {
 
   const [audioFile, setAudioFile] = useState<File | null>(null);
 
-  // Two knobs:
-  // 1) Redact locally before sending text to the backend (safe default for demos)
-  // 2) Enforce server-side PHI gate (for “hard gate” demo). If PHI is detected, backend rejects.
+  // knobs
   const [redactBeforeSend, setRedactBeforeSend] = useState(true);
   const [enforceRedactionGate, setEnforceRedactionGate] = useState(false);
 
-  const [busy, setBusy] = useState<{ transcribe: boolean; generate: boolean; redact: boolean; send: boolean }>({
+  // quality/safety UX extras
+  const [evidenceFilter, setEvidenceFilter] = useState<"all" | "unverified" | "timestamp">("all");
+  const [outputPhiStatus, setOutputPhiStatus] = useState<"unknown" | "clean" | "pii">("unknown");
+  const [outputPhiDetail, setOutputPhiDetail] = useState<string | null>(null);
+
+  const [busy, setBusy] = useState<{
+    transcribe: boolean;
+    generate: boolean;
+    redact: boolean;
+    send: boolean;
+    outputCheck: boolean;
+    copy: boolean;
+  }>({
     transcribe: false,
     generate: false,
     redact: false,
     send: false,
+    outputCheck: false,
+    copy: false,
   });
 
   const [error, setError] = useState<string | null>(null);
   const [notices, setNotices] = useState<string[]>([]);
 
-  // Keep the exact transcript/segments used for the last SOAP generation (for evidence rendering consistency)
+  // Keep exact inputs used for last SOAP generation (evidence rendering consistency)
   const [transcriptUsed, setTranscriptUsed] = useState<string>("");
   const [segmentsUsed, setSegmentsUsed] = useState<Segment[] | null>(null);
 
@@ -255,8 +396,13 @@ export default function ClinicianPage() {
   const evidence = soapResp?.evidence ?? [];
   const hasEvidence = evidence.length > 0;
 
+  const firstRender = useRef(true);
+
   // Load demo transcript/segments if present
   useEffect(() => {
+    if (!firstRender.current) return;
+    firstRender.current = false;
+
     try {
       const rawT = localStorage.getItem(LS_KEYS.transcript);
       const rawS = localStorage.getItem(LS_KEYS.segments);
@@ -298,6 +444,10 @@ export default function ClinicianPage() {
     setSegments(null);
     setAudioFile(null);
     setActiveView("render");
+
+    setEvidenceFilter("all");
+    setOutputPhiStatus("unknown");
+    setOutputPhiDetail(null);
   }
 
   async function transcribeAudio() {
@@ -328,7 +478,6 @@ export default function ClinicianPage() {
       setTranscript(t);
       setSegments(segs);
 
-      // persist for demo convenience
       try {
         localStorage.setItem(LS_KEYS.transcript, t);
         if (segs) localStorage.setItem(LS_KEYS.segments, JSON.stringify(segs));
@@ -360,7 +509,7 @@ export default function ClinicianPage() {
       const redacted = String(resp?.redacted ?? t);
 
       setTranscript(redacted);
-      setRedactBeforeSend(false); // already redacted; don't double-redact
+      setRedactBeforeSend(false);
       setNotices((n) => [
         ...n,
         resp?.piiDetected ? "PII detected and redacted (best-effort)." : "Redaction applied (best-effort).",
@@ -377,14 +526,15 @@ export default function ClinicianPage() {
     setNotices([]);
     setSoapResp(null);
     setSelectedEvidenceIdx(null);
+    setOutputPhiStatus("unknown");
+    setOutputPhiDetail(null);
+
     setBusy((b) => ({ ...b, generate: true }));
 
     try {
       const t = transcriptToSend.trim();
       if (!t) throw new Error("Empty transcript.");
 
-      // If we redact before sending, the raw STT segments may still be unredacted.
-      // Evidence linking is best-effort; still pass segments if available (timestamp “wow”).
       const payload = {
         transcript: t,
         segments: segments ?? undefined,
@@ -402,8 +552,16 @@ export default function ClinicianPage() {
       setActiveView("render");
 
       if (parsed.data.warnings?.length) setNotices(parsed.data.warnings);
-      if ((parsed.data.evidence?.filter((e) => e.verified === false).length ?? 0) > 0) {
+
+      const unverifiedCount = parsed.data.evidence?.filter((e) => e.verified === false).length ?? 0;
+      if (unverifiedCount > 0) {
         setNotices((n) => [...n, "Some SOAP lines are unverified (no strong evidence match). Review recommended."]);
+      }
+
+      // If backend already flags PII on output, surface it (forward compatible).
+      if (parsed.data.piiDetected === true) {
+        setOutputPhiStatus("pii");
+        setNotices((n) => [...n, "Safety: backend flagged potential PII in the generated output."]);
       }
     } catch (e: any) {
       if (e?.code === "PII_DETECTED") {
@@ -449,8 +607,8 @@ export default function ClinicianPage() {
     }
     const idx = soapResp.evidence.findIndex(
       (e) =>
-        String(e.section ?? "").toLowerCase() === section &&
-        String(e.text ?? "").trim().toLowerCase() === line.trim().toLowerCase()
+        normalizeLine(String(e.section ?? "")) === normalizeLine(section) &&
+        normalizeLine(String(e.text ?? "")) === normalizeLine(line)
     );
 
     setActiveView("evidence");
@@ -471,12 +629,86 @@ export default function ClinicianPage() {
 
   const previewRedacted = redactBeforeSend && transcript.trim();
 
-  const evidenceStats = useMemo(() => {
-    const total = evidence.length;
-    const verified = evidence.filter((e) => e.verified === true).length;
-    const unverified = evidence.filter((e) => e.verified === false).length;
-    return { total, verified, unverified };
-  }, [evidence]);
+  // Evidence + quality stats (client-side Trust Score)
+  const quality = useMemo(() => {
+    if (!soapResp) {
+      return {
+        trustScore: 0,
+        trustLabel: "—" as const,
+        evidenceTotal: 0,
+        evidenceVerified: 0,
+        evidenceUnverified: 0,
+        timestampEvidence: 0,
+        linesTotal: 0,
+        linesWithEvidence: 0,
+        lineCoveragePct: 0,
+      };
+    }
+
+    const ev = soapResp.evidence ?? [];
+    const evidenceTotal = ev.length;
+    const evidenceVerified = ev.filter((e) => e.verified === true).length;
+    const evidenceUnverified = ev.filter((e) => e.verified === false).length;
+    const timestampEvidence = ev.filter(
+      (e) => typeof e.startMs === "number" && typeof e.endMs === "number" && (e.endMs ?? 0) > (e.startMs ?? 0)
+    ).length;
+
+    const lineKeys = new Set<string>();
+    const addLines = (section: string, v: string[] | string) => {
+      for (const line of asLines(v)) {
+        lineKeys.add(`${normalizeLine(section)}::${normalizeLine(line)}`);
+      }
+    };
+    addLines("subjective", soapResp.subjective);
+    addLines("objective", soapResp.objective);
+    addLines("assessment", soapResp.assessment);
+    addLines("plan", soapResp.plan);
+
+    const linesTotal = lineKeys.size;
+
+    const evidenceKeySet = new Set<string>();
+    for (const e of ev) {
+      const s = normalizeLine(String(e.section ?? ""));
+      const t = normalizeLine(String(e.text ?? ""));
+      if (s && t) evidenceKeySet.add(`${s}::${t}`);
+    }
+    let linesWithEvidence = 0;
+    for (const k of lineKeys) if (evidenceKeySet.has(k)) linesWithEvidence += 1;
+
+    const verifiedRatio = evidenceTotal ? evidenceVerified / evidenceTotal : 0;
+    const timestampRatio = evidenceTotal ? timestampEvidence / evidenceTotal : 0;
+    const lineCoverageRatio = linesTotal ? linesWithEvidence / linesTotal : 0;
+
+    // Simple, explainable blend (feel free to tune):
+    // - Verified evidence matters most
+    // - Timestamped evidence is a bonus
+    // - Coverage discourages “free-floating” bullets
+    let trustScore = Math.round((0.6 * verifiedRatio + 0.25 * timestampRatio + 0.15 * lineCoverageRatio) * 100);
+    trustScore = clamp(trustScore, 0, 100);
+
+    const trustLabel = trustScore >= 85 ? "High" : trustScore >= 65 ? "Medium" : trustScore > 0 ? "Low" : "—";
+
+    const lineCoveragePct = Math.round(lineCoverageRatio * 100);
+
+    // If backend already provides quality.trustScore, prefer it.
+    const backendTrust = soapResp.quality?.trustScore;
+    const backendCoverage = soapResp.quality?.lineCoveragePct;
+    const finalTrustScore = typeof backendTrust === "number" ? clamp(Math.round(backendTrust), 0, 100) : trustScore;
+    const finalCoverage =
+      typeof backendCoverage === "number" ? clamp(Math.round(backendCoverage), 0, 100) : lineCoveragePct;
+
+    return {
+      trustScore: finalTrustScore,
+      trustLabel,
+      evidenceTotal,
+      evidenceVerified,
+      evidenceUnverified,
+      timestampEvidence,
+      linesTotal,
+      linesWithEvidence,
+      lineCoveragePct: finalCoverage,
+    };
+  }, [soapResp]);
 
   const entityStats = useMemo(() => {
     const ents = soapResp?.entities ?? null;
@@ -486,6 +718,100 @@ export default function ClinicianPage() {
     return Array.from(counts.entries()).sort((a, b) => b[1] - a[1]).slice(0, 8);
   }, [soapResp?.entities]);
 
+  const evidenceListFiltered = useMemo(() => {
+    const ev = evidence ?? [];
+    if (evidenceFilter === "unverified") return ev.filter((e) => e.verified === false);
+    if (evidenceFilter === "timestamp")
+      return ev.filter(
+        (e) => typeof e.startMs === "number" && typeof e.endMs === "number" && (e.endMs ?? 0) > (e.startMs ?? 0)
+      );
+    return ev;
+  }, [evidence, evidenceFilter]);
+
+  async function checkOutputForPhi() {
+    setError(null);
+    setNotices([]);
+
+    if (!soapResp) {
+      setError("Generate a SOAP note first.");
+      return;
+    }
+
+    setBusy((b) => ({ ...b, outputCheck: true }));
+    try {
+      const text = soapToText(soapResp);
+      const resp = await apiPost<{ redacted: string; piiDetected?: boolean }>("/privacy/redact", { text });
+      const redacted = String(resp?.redacted ?? "");
+      const pii = resp?.piiDetected === true || (redacted && redacted !== text);
+
+      setOutputPhiStatus(pii ? "pii" : "clean");
+
+      if (pii) {
+        const preview = redacted && redacted !== text ? redacted.slice(0, 600) : "";
+        setOutputPhiDetail(
+          preview
+            ? `Redacted preview (first ~600 chars):\n\n${preview}`
+            : "Potential PII detected. Consider redacting input and/or enabling server-side PHI gate."
+        );
+        setNotices((n) => [...n, "Output safety check: potential PII detected (best-effort)."]);
+      } else {
+        setOutputPhiDetail(null);
+        setNotices((n) => [...n, "Output safety check: no PII detected (best-effort)."]);
+      }
+    } catch {
+      setError("Output PHI check failed (or API not running).");
+    } finally {
+      setBusy((b) => ({ ...b, outputCheck: false }));
+    }
+  }
+
+  function exportRedactedJson() {
+    if (!soapResp) return;
+
+    const redacted: SoapResponse = {
+      ...soapResp,
+      subjective: asLines(soapResp.subjective).map(localRedact),
+      objective: asLines(soapResp.objective).map(localRedact),
+      assessment: asLines(soapResp.assessment).map(localRedact),
+      plan: asLines(soapResp.plan).map(localRedact),
+      warnings: [...(soapResp.warnings ?? []), "Client-side redaction applied on export (best-effort)."],
+      redacted: true,
+    };
+
+    if (redacted.evidence?.length) {
+      redacted.evidence = redacted.evidence.map((e) => ({
+        ...e,
+        text: e.text ? localRedact(e.text) : e.text,
+        snippet: e.snippet ? localRedact(e.snippet) : e.snippet,
+      }));
+    }
+
+    downloadJson("soap-response.redacted.json", redacted);
+  }
+
+  async function copySoapText() {
+    setError(null);
+    setNotices([]);
+    if (!soapResp) {
+      setError("Generate a SOAP note first.");
+      return;
+    }
+
+    setBusy((b) => ({ ...b, copy: true }));
+    try {
+      const ok = await copyToClipboard(soapToText(soapResp));
+      setNotices((n) => [...n, ok ? "Copied SOAP text to clipboard." : "Could not copy (browser blocked clipboard)."]);
+    } finally {
+      setBusy((b) => ({ ...b, copy: false }));
+    }
+  }
+
+  const outputPhiBadge = useMemo(() => {
+    if (outputPhiStatus === "unknown") return { label: "Output PHI: —", cls: "bg-slate-100 text-slate-700" };
+    if (outputPhiStatus === "clean") return { label: "Output PHI: clean", cls: "bg-emerald-100 text-emerald-900" };
+    return { label: "Output PHI: flagged", cls: "bg-rose-100 text-rose-900" };
+  }, [outputPhiStatus]);
+
   return (
     <main className="min-h-screen bg-gradient-to-b from-white to-slate-50">
       <div className="mx-auto max-w-6xl px-6 py-8">
@@ -494,12 +820,12 @@ export default function ClinicianPage() {
             <div className="flex items-center gap-3">
               <h1 className="text-3xl font-semibold tracking-tight text-slate-900">Clinician mode</h1>
               <span className="rounded-full border border-slate-200 bg-white px-3 py-1 text-xs text-slate-700 shadow-sm">
-                Voice/Text → SOAP • Evidence-linked
+                Voice/Text → SOAP • Evidence-linked • Trust Scored
               </span>
             </div>
             <p className="mt-2 max-w-2xl text-sm text-slate-700">
-              Paste a synthetic visit transcript (or transcribe audio) and generate a clean SOAP note (S/O/A/P) with
-              evidence links and a quality gate.{" "}
+              Paste a synthetic visit transcript (or transcribe audio) and generate a clean SOAP note with evidence
+              links, a trust score, and optional PHI gating.{" "}
               <span className="text-slate-500">Informational only — not medical advice.</span>
             </p>
           </div>
@@ -575,6 +901,7 @@ export default function ClinicianPage() {
             >
               Clear
             </button>
+
             <button
               disabled={!soapResp}
               onClick={() => soapResp && downloadJson("soap-response.json", soapResp)}
@@ -584,7 +911,20 @@ export default function ClinicianPage() {
                   : "cursor-not-allowed bg-slate-100 text-slate-400"
               }`}
             >
-              Export full JSON
+              Export JSON
+            </button>
+
+            <button
+              disabled={!soapResp}
+              onClick={exportRedactedJson}
+              className={`rounded-xl px-4 py-2 text-sm font-medium ${
+                soapResp
+                  ? "border border-slate-200 bg-white text-slate-900 hover:bg-slate-50"
+                  : "cursor-not-allowed bg-slate-100 text-slate-400"
+              }`}
+              title="Applies best-effort client-side redaction during export"
+            >
+              Export redacted JSON
             </button>
           </div>
         </div>
@@ -644,8 +984,7 @@ export default function ClinicianPage() {
                 <div className="mt-3 text-xs text-slate-600">
                   {segments?.length ? (
                     <span>
-                      Timestamp segments:{" "}
-                      <span className="font-semibold text-slate-800">{segments.length}</span>
+                      Timestamp segments: <span className="font-semibold text-slate-800">{segments.length}</span>
                     </span>
                   ) : (
                     <span>No segments yet (paste text or transcribe audio).</span>
@@ -656,7 +995,8 @@ export default function ClinicianPage() {
               <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
                 <div className="text-xs font-semibold text-slate-700">Generate SOAP</div>
                 <p className="mt-1 text-xs text-slate-600">
-                  Client validates the JSON schema. Evidence items are marked as verified/unverified.
+                  Client validates the JSON schema. Evidence items are marked as verified/unverified. Trust score is
+                  computed from evidence quality + coverage.
                 </p>
                 <div className="mt-3 flex flex-wrap gap-2">
                   <button
@@ -687,8 +1027,8 @@ export default function ClinicianPage() {
                 <div className="mt-3 rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs text-slate-600">
                   <div className="font-semibold text-slate-700">Demo tip</div>
                   <div className="mt-1">
-                    For a safe default: keep <span className="font-medium">local redaction ON</span>. For the “PHI hard
-                    gate” demo: turn <span className="font-medium">local redaction OFF</span>, turn{" "}
+                    Safe default: keep <span className="font-medium">local redaction ON</span>. For the “PHI hard gate”
+                    demo: turn <span className="font-medium">local redaction OFF</span>, turn{" "}
                     <span className="font-medium">PHI gate ON</span>, then click “Redact via API” after it blocks.
                   </div>
                 </div>
@@ -724,8 +1064,128 @@ export default function ClinicianPage() {
           <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
             <h2 className="text-lg font-semibold text-slate-900">Output</h2>
             <p className="mt-2 text-sm text-slate-700">
-              Review the structured note, check evidence, then push the Plan to patient tasks.
+              Review the structured note, check evidence/trust, then push the Plan to patient tasks.
             </p>
+
+            {/* Quality & Safety strip */}
+            <div className="mt-4 rounded-2xl border border-slate-200 bg-slate-50 p-4">
+              <div className="flex items-center justify-between gap-3">
+                <div className="text-xs font-semibold text-slate-700">Quality & Safety</div>
+                <span className={`rounded-full px-2 py-1 text-[11px] font-medium ${outputPhiBadge.cls}`}>
+                  {outputPhiBadge.label}
+                </span>
+              </div>
+
+              <div className="mt-3">
+                <div className="flex items-end justify-between gap-2">
+                  <div>
+                    <div className="text-xs text-slate-600">Trust score</div>
+                    <div className="mt-0.5 flex items-baseline gap-2">
+                      <div className="text-2xl font-semibold text-slate-900">{soapResp ? quality.trustScore : "—"}</div>
+                      <div className="text-xs font-semibold text-slate-700">{soapResp ? quality.trustLabel : ""}</div>
+                    </div>
+                  </div>
+                  <div className="text-[11px] text-slate-600 text-right">
+                    <div>
+                      Evidence verified:{" "}
+                      <span className="font-semibold text-slate-800">
+                        {quality.evidenceVerified}/{quality.evidenceTotal || "—"}
+                      </span>
+                    </div>
+                    <div>
+                      Line coverage:{" "}
+                      <span className="font-semibold text-slate-800">
+                        {soapResp ? `${quality.lineCoveragePct}%` : "—"}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="mt-2 h-2 w-full rounded-full bg-white">
+                  <div
+                    className="h-2 rounded-full bg-slate-900"
+                    style={{ width: `${soapResp ? quality.trustScore : 0}%` }}
+                  />
+                </div>
+
+                <div className="mt-3 flex flex-wrap gap-2 text-[11px] text-slate-700">
+                  <span className="rounded-full border border-slate-200 bg-white px-2 py-1">
+                    Timestamp evidence:{" "}
+                    <span className="font-semibold text-slate-900">{soapResp ? quality.timestampEvidence : "—"}</span>
+                  </span>
+                  <span className="rounded-full border border-slate-200 bg-white px-2 py-1">
+                    Unverified:{" "}
+                    <span className="font-semibold text-slate-900">{soapResp ? quality.evidenceUnverified : "—"}</span>
+                  </span>
+                  <span className="rounded-full border border-slate-200 bg-white px-2 py-1">
+                    Segments:{" "}
+                    <span className="font-semibold text-slate-900">{segmentsUsed?.length ?? segments?.length ?? 0}</span>
+                  </span>
+                  <span className="rounded-full border border-slate-200 bg-white px-2 py-1">
+                    PHI gate:{" "}
+                    <span className="font-semibold text-slate-900">{enforceRedactionGate ? "ON" : "OFF"}</span>
+                  </span>
+                </div>
+              </div>
+
+              <div className="mt-3 flex flex-wrap gap-2">
+                <button
+                  onClick={checkOutputForPhi}
+                  disabled={busy.outputCheck || !soapResp}
+                  className={`rounded-xl px-3 py-1.5 text-xs font-medium ${
+                    busy.outputCheck || !soapResp
+                      ? "cursor-not-allowed bg-white text-slate-400"
+                      : "border border-slate-200 bg-white text-slate-900 hover:bg-slate-50"
+                  }`}
+                  title="Calls /api/privacy/redact on the generated note text (best-effort)"
+                >
+                  {busy.outputCheck ? "Checking…" : "Check output for PHI"}
+                </button>
+
+                <button
+                  onClick={copySoapText}
+                  disabled={busy.copy || !soapResp}
+                  className={`rounded-xl px-3 py-1.5 text-xs font-medium ${
+                    busy.copy || !soapResp
+                      ? "cursor-not-allowed bg-white text-slate-400"
+                      : "border border-slate-200 bg-white text-slate-900 hover:bg-slate-50"
+                  }`}
+                >
+                  {busy.copy ? "Copying…" : "Copy SOAP text"}
+                </button>
+
+                <button
+                  onClick={() => soapResp && downloadText("soap-note.txt", soapToText(soapResp))}
+                  disabled={!soapResp}
+                  className={`rounded-xl px-3 py-1.5 text-xs font-medium ${
+                    !soapResp
+                      ? "cursor-not-allowed bg-white text-slate-400"
+                      : "border border-slate-200 bg-white text-slate-900 hover:bg-slate-50"
+                  }`}
+                >
+                  Export .txt
+                </button>
+
+                <button
+                  onClick={() => soapResp && downloadJson("fhir-lite.bundle.json", buildFhirLiteBundle(soapResp))}
+                  disabled={!soapResp}
+                  className={`rounded-xl px-3 py-1.5 text-xs font-medium ${
+                    !soapResp
+                      ? "cursor-not-allowed bg-white text-slate-400"
+                      : "border border-slate-200 bg-white text-slate-900 hover:bg-slate-50"
+                  }`}
+                  title="FHIR-like JSON bundle for demo/interoperability storytelling (not guaranteed strict FHIR validation)."
+                >
+                  Export FHIR-lite
+                </button>
+              </div>
+
+              {outputPhiDetail && (
+                <pre className="mt-3 max-h-[180px] overflow-auto whitespace-pre-wrap rounded-xl border border-slate-200 bg-white p-3 text-[11px] text-slate-800">
+                  {outputPhiDetail}
+                </pre>
+              )}
+            </div>
 
             <div className="mt-4 inline-flex w-full rounded-xl border border-slate-200 bg-white p-1 shadow-sm">
               <button
@@ -826,12 +1286,45 @@ export default function ClinicianPage() {
               </div>
             ) : activeView === "evidence" ? (
               <div className="mt-4 space-y-3">
-                <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-xs text-slate-700">
-                  Evidence links connect SOAP lines to transcript spans.{" "}
-                  <span className="font-semibold">
-                    Verified: {evidenceStats.verified}/{evidenceStats.total}
-                  </span>{" "}
-                  {evidenceStats.unverified ? <span>• Unverified: {evidenceStats.unverified}</span> : null}
+                <div className="flex items-center justify-between gap-3 rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-xs text-slate-700">
+                  <div>
+                    Evidence links connect SOAP lines to transcript spans.{" "}
+                    <span className="font-semibold">
+                      Verified: {quality.evidenceVerified}/{quality.evidenceTotal}
+                    </span>{" "}
+                    {quality.evidenceUnverified ? <span>• Unverified: {quality.evidenceUnverified}</span> : null}
+                  </div>
+
+                  <div className="inline-flex rounded-lg border border-slate-200 bg-white p-1">
+                    <button
+                      onClick={() => setEvidenceFilter("all")}
+                      className={`rounded-md px-2 py-1 text-[11px] font-medium ${
+                        evidenceFilter === "all" ? "bg-slate-900 text-white" : "text-slate-700 hover:bg-slate-50"
+                      }`}
+                    >
+                      All
+                    </button>
+                    <button
+                      onClick={() => setEvidenceFilter("unverified")}
+                      className={`rounded-md px-2 py-1 text-[11px] font-medium ${
+                        evidenceFilter === "unverified"
+                          ? "bg-slate-900 text-white"
+                          : "text-slate-700 hover:bg-slate-50"
+                      }`}
+                    >
+                      Unverified
+                    </button>
+                    <button
+                      onClick={() => setEvidenceFilter("timestamp")}
+                      className={`rounded-md px-2 py-1 text-[11px] font-medium ${
+                        evidenceFilter === "timestamp"
+                          ? "bg-slate-900 text-white"
+                          : "text-slate-700 hover:bg-slate-50"
+                      }`}
+                    >
+                      Timestamp
+                    </button>
+                  </div>
                 </div>
 
                 {selectedEvidence && (
@@ -871,7 +1364,7 @@ export default function ClinicianPage() {
                 )}
 
                 <div className="max-h-[360px] overflow-auto rounded-2xl border border-slate-200 bg-white p-3">
-                  {(evidence ?? []).slice(0, 60).map((ev, i) => {
+                  {(evidenceListFiltered ?? []).slice(0, 80).map((ev, i) => {
                     const verified = ev.verified !== false;
                     const meta =
                       typeof ev.startMs === "number" && typeof ev.endMs === "number"
@@ -886,9 +1379,7 @@ export default function ClinicianPage() {
                         key={`${i}-${ev.section ?? "s"}-${ev.text ?? ""}`}
                         onClick={() => setSelectedEvidenceIdx(i)}
                         className={`mb-2 w-full rounded-xl border px-3 py-2 text-left ${
-                          isSelected
-                            ? "border-slate-400 bg-slate-50"
-                            : "border-slate-200 bg-white hover:bg-slate-50"
+                          isSelected ? "border-slate-400 bg-slate-50" : "border-slate-200 bg-white hover:bg-slate-50"
                         }`}
                       >
                         <div className="flex items-center justify-between gap-2">
@@ -908,6 +1399,11 @@ export default function ClinicianPage() {
                       </button>
                     );
                   })}
+                  {!evidenceListFiltered.length && (
+                    <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-700">
+                      No evidence matches this filter.
+                    </div>
+                  )}
                 </div>
               </div>
             ) : (
@@ -931,11 +1427,10 @@ export default function ClinicianPage() {
                     <ul className="mt-2 space-y-1 text-sm text-slate-900">
                       {asLines(value).length ? (
                         asLines(value).map((line, idx) => {
-                          // try to find matching evidence and show a badge inline
                           const evIdx = soapResp.evidence?.findIndex(
                             (e) =>
-                              String(e.section ?? "").toLowerCase() === key &&
-                              String(e.text ?? "").trim().toLowerCase() === line.trim().toLowerCase()
+                              normalizeLine(String(e.section ?? "")) === normalizeLine(key) &&
+                              normalizeLine(String(e.text ?? "")) === normalizeLine(line)
                           );
 
                           const ev = typeof evIdx === "number" && evIdx >= 0 ? soapResp.evidence?.[evIdx] : null;
@@ -960,7 +1455,11 @@ export default function ClinicianPage() {
                                     >
                                       {verified ? "Verified" : "Unverified"}
                                     </span>
-                                  ) : null}
+                                  ) : (
+                                    <span className="mt-0.5 rounded-full bg-slate-100 px-2 py-0.5 text-[11px] font-medium text-slate-700">
+                                      No evidence
+                                    </span>
+                                  )}
                                 </div>
                               </button>
                             </li>
