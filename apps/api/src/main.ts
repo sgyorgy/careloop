@@ -106,6 +106,8 @@ const EnvSchema = z.object({
   AZURE_OPENAI_KEY: z.string().min(1).optional(),
   AZURE_OPENAI_DEPLOYMENT: z.string().min(1).optional(),
   AZURE_OPENAI_API_VERSION: z.string().min(1).optional(),
+  // optional: separate deployment for diary
+  AZURE_OPENAI_DIARY_DEPLOYMENT: z.string().min(1).optional(),
 
   AZURE_SPEECH_KEY: z.string().min(1).optional(),
   AZURE_SPEECH_REGION: z.string().min(1).optional(),
@@ -116,11 +118,13 @@ const EnvSchema = z.object({
 
   // optional
   MAX_TRANSCRIPT_CHARS: z.string().optional(),
-});
 
-type Soap = z.infer<typeof SoapSchema>;
-type EvidenceLink = z.infer<typeof EvidenceLinkSchema>;
-type Segment = z.infer<typeof SegmentSchema>;
+  // Safety/quality knobs
+  OUTPUT_PII_MODE: z.enum(["redact", "block", "off"]).optional(), // default: redact
+  DEFAULT_ENFORCE_REDACTION: z.enum(["true", "false"]).optional(), // default: false
+  DIARY_SUMMARY_MAX_ENTRIES: z.string().optional(), // default: 30
+  DIARY_NOTES_MAX_CHARS: z.string().optional(), // default: 400
+});
 
 const SegmentSchema = z.object({
   startMs: z.number().int().nonnegative(),
@@ -157,13 +161,74 @@ const DiaryEntrySchema = z.object({
   tags: z.array(z.string()).optional(),
 });
 
+const DiaryEvidenceRefSchema = z.object({
+  entryIndex: z.number().int().nonnegative(),
+  date: z.string(),
+  snippet: z.string().optional(),
+  score: z.number().int().nonnegative().optional(),
+});
+
+const DiaryEvidenceItemSchema = z.object({
+  kind: z.enum(["bullet", "trigger", "suggestion", "redFlag", "question"]),
+  text: z.string().min(1),
+  references: z.array(DiaryEvidenceRefSchema).optional(),
+  verified: z.boolean(),
+});
+
+const TrustSchema = z.object({
+  scorePct: z.number().min(0).max(100),
+  verified: z.number().int().nonnegative(),
+  unverified: z.number().int().nonnegative(),
+  piiDetectedInput: z.boolean().optional(),
+  piiDetectedOutput: z.boolean().optional(),
+  mode: z.enum(["llm", "deterministic"]).optional(),
+});
+
+const DiarySummarySchema = z.object({
+  headline: z.string(),
+  bullets: z.array(z.string()),
+  possibleTriggers: z.array(z.string()),
+  gentleSuggestions: z.array(z.string()),
+  last7DaysAvgSymptom: z.number().nullable().optional(),
+  // new (optional) UX boosters
+  redFlags: z.array(z.string()).optional(),
+  questionsForClinician: z.array(z.string()).optional(),
+  // evidence + trust
+  evidence: z.array(DiaryEvidenceItemSchema).optional(),
+  trust: TrustSchema.optional(),
+});
+
+type Soap = z.infer<typeof SoapSchema>;
+type EvidenceLink = z.infer<typeof EvidenceLinkSchema>;
+type Segment = z.infer<typeof SegmentSchema>;
+type DiaryEntry = z.infer<typeof DiaryEntrySchema>;
+type DiarySummary = z.infer<typeof DiarySummarySchema>;
+type DiaryEvidenceItem = z.infer<typeof DiaryEvidenceItemSchema>;
+
 // ---------------- helpers ----------------
 const env = EnvSchema.safeParse(process.env);
 if (!env.success) {
   // safe: don't print env values
-  log.warn({ issues: env.error.issues.map((i) => ({ path: i.path, message: i.message })) }, "env validation warning");
+  log.warn(
+    { issues: env.error.issues.map((i) => ({ path: i.path, message: i.message })) },
+    "env validation warning"
+  );
 }
+
 const MAX_TRANSCRIPT_CHARS = Number(process.env.MAX_TRANSCRIPT_CHARS ?? 50_000);
+const OUTPUT_PII_MODE = (process.env.OUTPUT_PII_MODE ?? "redact") as "redact" | "block" | "off";
+const DEFAULT_ENFORCE_REDACTION = (process.env.DEFAULT_ENFORCE_REDACTION ?? "false") === "true";
+const DIARY_SUMMARY_MAX_ENTRIES = Math.max(1, Math.min(365, Number(process.env.DIARY_SUMMARY_MAX_ENTRIES ?? 30)));
+const DIARY_NOTES_MAX_CHARS = Math.max(0, Math.min(2000, Number(process.env.DIARY_NOTES_MAX_CHARS ?? 400)));
+
+function clamp(n: number, lo: number, hi: number) {
+  return Math.max(lo, Math.min(hi, n));
+}
+
+function mean(nums: number[]) {
+  if (!nums.length) return null;
+  return nums.reduce((a, b) => a + b, 0) / nums.length;
+}
 
 function makeAzureOpenAI() {
   const endpoint = process.env.AZURE_OPENAI_ENDPOINT;
@@ -212,6 +277,13 @@ function safeJsonParse(s: string): unknown {
 function truncateForProcessing(text: string, maxChars: number) {
   if (text.length <= maxChars) return text;
   return text.slice(0, maxChars);
+}
+
+function truncateNote(note: string, maxChars: number) {
+  const t = String(note ?? "").replace(/\s+/g, " ").trim();
+  if (!maxChars) return "";
+  if (t.length <= maxChars) return t;
+  return t.slice(0, maxChars) + "…";
 }
 
 function mockSoap(transcript: string) {
@@ -328,6 +400,14 @@ function buildEvidenceFromSearch(transcript: string, soap: Soap) {
     }
   }
   return out.slice(0, 40);
+}
+
+function computeTrustFromEvidence(items: Array<{ verified?: boolean }>) {
+  const total = items.length;
+  const verified = items.filter((x) => x.verified).length;
+  const unverified = Math.max(0, total - verified);
+  const scorePct = total ? Math.round((verified / total) * 100) : 0;
+  return { verified, unverified, scorePct };
 }
 
 /**
@@ -468,6 +548,38 @@ async function redactTextBestEffort(text: string): Promise<{ redacted: string; p
   }
 }
 
+async function redactStringsBestEffort<T extends Record<string, any>>(
+  obj: T
+): Promise<{ redacted: T; piiDetected: boolean }> {
+  if (OUTPUT_PII_MODE === "off") return { redacted: obj, piiDetected: false };
+
+  let piiDetected = false;
+
+  const redactOne = async (s: string) => {
+    const r = await redactTextBestEffort(s);
+    piiDetected = piiDetected || r.piiDetected;
+    return r.redacted;
+  };
+
+  const walk = async (v: any): Promise<any> => {
+    if (typeof v === "string") return redactOne(v);
+    if (Array.isArray(v)) {
+      const out = [];
+      for (const item of v) out.push(await walk(item));
+      return out;
+    }
+    if (v && typeof v === "object") {
+      const out: any = {};
+      for (const [k, val] of Object.entries(v)) out[k] = await walk(val);
+      return out;
+    }
+    return v;
+  };
+
+  const redacted = (await walk(obj)) as T;
+  return { redacted, piiDetected };
+}
+
 async function extractHealthcareEntitiesBestEffort(transcript: string) {
   const ta = makeTextAnalytics();
   if (!ta) return null;
@@ -511,6 +623,198 @@ function asyncHandler<TReq extends Request, TRes extends Response>(
   return (req: TReq, res: TRes, next: NextFunction) => {
     Promise.resolve(fn(req, res, next)).catch(next);
   };
+}
+
+function normalizeDiary(diary: DiaryEntry[]) {
+  return diary
+    .slice()
+    .sort((a, b) => a.date.localeCompare(b.date))
+    .map((e) => ({
+      ...e,
+      date: e.date.slice(0, 10),
+      notes: e.notes ? truncateNote(e.notes, DIARY_NOTES_MAX_CHARS) : undefined,
+      tags: (e.tags ?? []).map((t) => String(t).trim()).filter(Boolean),
+    }));
+}
+
+function diaryEntryText(e: { notes?: string; tags?: string[] }) {
+  const parts = [
+    (e.notes ?? "").trim(),
+    ...(e.tags ?? []).map((t) => String(t ?? "").trim()).filter(Boolean),
+  ].filter(Boolean);
+  return parts.join(" ").replace(/\s+/g, " ").trim();
+}
+
+function pickBestDiaryEvidence(text: string, diary: ReturnType<typeof normalizeDiary>) {
+  let best: { i: number; score: number } | null = null;
+  for (let i = 0; i < diary.length; i++) {
+    const entry = diary[i];
+    const corpus = diaryEntryText(entry);
+    if (!corpus) continue;
+    const s = scoreOverlap(text, corpus);
+    if (!best || s > best.score) best = { i, score: s };
+  }
+  if (!best) return null;
+  const entry = diary[best.i];
+  return {
+    entryIndex: best.i,
+    date: entry.date,
+    snippet: entry.notes ? truncateNote(entry.notes, 180) : undefined,
+    score: best.score,
+  };
+}
+
+function buildDiaryEvidence(summary: DiarySummary, diary: ReturnType<typeof normalizeDiary>): DiaryEvidenceItem[] {
+  const out: DiaryEvidenceItem[] = [];
+
+  const addMany = (kind: DiaryEvidenceItem["kind"], items?: string[]) => {
+    for (const text of (items ?? []).map((x) => String(x).trim()).filter(Boolean).slice(0, 12)) {
+      const ref = pickBestDiaryEvidence(text, diary);
+      const verified = Boolean(ref && (ref.score ?? 0) >= 2);
+      out.push({
+        kind,
+        text,
+        references: ref ? [ref] : [],
+        verified,
+      });
+    }
+  };
+
+  addMany("bullet", summary.bullets);
+  addMany("trigger", summary.possibleTriggers);
+  addMany("suggestion", summary.gentleSuggestions);
+  addMany("redFlag", summary.redFlags);
+  addMany("question", summary.questionsForClinician);
+
+  return out.slice(0, 60);
+}
+
+function deterministicDiarySummary(diary: ReturnType<typeof normalizeDiary>): DiarySummary {
+  const last7 = diary.slice(-7);
+  const avgSym = mean(last7.map((e) => e.symptomScore));
+  const avgSleep = mean(last7.map((e) => e.sleepHours));
+  const avgMood = mean(last7.map((e) => e.moodScore));
+
+  const triggers = Array.from(
+    new Set(last7.flatMap((e) => (e.tags ?? []).map((t) => t.toLowerCase())).filter(Boolean))
+  ).slice(0, 5);
+
+  const bullets: string[] = [];
+  if (avgSym != null) bullets.push(`Last 7 days avg symptom score: ${avgSym.toFixed(1)} / 10`);
+  if (avgSleep != null) bullets.push(`Last 7 days avg sleep: ${avgSleep.toFixed(1)} hours`);
+  if (avgMood != null) bullets.push(`Last 7 days avg mood: ${avgMood.toFixed(1)} / 10`);
+  bullets.push("Patterns are hints only (not a diagnosis).");
+
+  const redFlags: string[] = [];
+  // gentle, non-diagnostic heuristics
+  const mostRecent = last7[last7.length - 1];
+  if (mostRecent && mostRecent.symptomScore >= 8) redFlags.push("Very high symptom score recently (consider timely check-in).");
+  if (avgSleep != null && avgSleep < 5) redFlags.push("Low average sleep over the last week.");
+
+  const questions: string[] = [];
+  if (triggers.length) questions.push(`Do symptoms correlate with: ${triggers.join(", ")}?`);
+  questions.push("Any recent medication changes or missed doses?");
+  questions.push("What improves or worsens symptoms (activity, meals, stress, sleep)?");
+
+  return {
+    headline: diary.length ? "Pre-visit summary (server)" : "Add diary entries to generate a summary",
+    bullets: diary.length ? bullets.slice(0, 6) : [],
+    possibleTriggers: diary.length ? triggers : [],
+    gentleSuggestions: diary.length
+      ? [
+          "Keep logging meals/sleep alongside symptoms.",
+          "If symptoms worsen or feel unsafe, consider contacting a clinician.",
+        ]
+      : [],
+    last7DaysAvgSymptom: avgSym,
+    redFlags: diary.length ? redFlags.slice(0, 5) : [],
+    questionsForClinician: diary.length ? questions.slice(0, 5) : [],
+  };
+}
+
+async function llmDiarySummary(diary: ReturnType<typeof normalizeDiary>, azure: ReturnType<typeof makeAzureOpenAI>) {
+  if (!azure) return null;
+
+  const diaryForModel = diary
+    .slice(-DIARY_SUMMARY_MAX_ENTRIES)
+    .map((e) => ({
+      date: e.date,
+      symptomScore: e.symptomScore,
+      sleepHours: e.sleepHours,
+      moodScore: e.moodScore,
+      notes: e.notes ?? "",
+      tags: e.tags ?? [],
+    }));
+
+  const last7 = diary.slice(-7);
+  const avgSym = mean(last7.map((e) => e.symptomScore));
+
+  const system = `You are an AI health diary summarizer.
+Return a STRICT JSON object only (no markdown, no extra keys).
+Schema:
+{
+  "headline": string,
+  "bullets": string[],                 // max 6, short bullet lines
+  "possibleTriggers": string[],        // max 5, single words/short phrases
+  "gentleSuggestions": string[],       // max 5, non-medical, supportive, non-urgent suggestions
+  "last7DaysAvgSymptom": number|null,  // may be null
+  "redFlags": string[],                // max 5, cautious and non-diagnostic
+  "questionsForClinician": string[]    // max 5, helpful clarifying questions
+}
+Rules:
+- DO NOT diagnose. Use cautious, informational phrasing.
+- DO NOT include personally identifying info (names, addresses, emails, phone numbers).
+- Prefer trends, correlations, and what to ask/track next.
+- If unsure, write items as "for clinician review".
+- Keep triggers to short phrases (e.g., "stress", "late meals", "poor sleep").`;
+
+  const user = `Diary entries (synthetic/anonymized). JSON array:
+${JSON.stringify(diaryForModel)}
+Context:
+- last7DaysAvgSymptom (computed server-side): ${avgSym == null ? "null" : avgSym.toFixed(2)}
+Return the JSON schema exactly.`;
+
+  const deployment = process.env.AZURE_OPENAI_DIARY_DEPLOYMENT || azure.deployment;
+
+  const completion = await azure.client.chat.completions.create({
+    model: deployment,
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: user },
+    ],
+    temperature: 0.2,
+    response_format: { type: "json_object" },
+  });
+
+  const content = completion.choices[0]?.message?.content ?? "{}";
+  const parsedJson = safeJsonParse(content);
+  if (!parsedJson) return null;
+
+  // Validate (soft): require keys, but allow optional in our server schema
+  const CandidateSchema = z.object({
+    headline: z.string().min(1),
+    bullets: z.array(z.string()).default([]),
+    possibleTriggers: z.array(z.string()).default([]),
+    gentleSuggestions: z.array(z.string()).default([]),
+    last7DaysAvgSymptom: z.number().nullable().optional(),
+    redFlags: z.array(z.string()).default([]),
+    questionsForClinician: z.array(z.string()).default([]),
+  });
+
+  const candidate = CandidateSchema.safeParse(parsedJson);
+  if (!candidate.success) return null;
+
+  const s: DiarySummary = {
+    headline: candidate.data.headline,
+    bullets: candidate.data.bullets.map((x) => String(x).trim()).filter(Boolean).slice(0, 6),
+    possibleTriggers: candidate.data.possibleTriggers.map((x) => String(x).trim()).filter(Boolean).slice(0, 5),
+    gentleSuggestions: candidate.data.gentleSuggestions.map((x) => String(x).trim()).filter(Boolean).slice(0, 5),
+    last7DaysAvgSymptom: candidate.data.last7DaysAvgSymptom ?? null,
+    redFlags: candidate.data.redFlags.map((x) => String(x).trim()).filter(Boolean).slice(0, 5),
+    questionsForClinician: candidate.data.questionsForClinician.map((x) => String(x).trim()).filter(Boolean).slice(0, 5),
+  };
+
+  return s;
 }
 
 // ---------------- routes ----------------
@@ -561,10 +865,7 @@ app.post(
       return res.json({
         transcript: trimmed,
         segments,
-        warnings:
-          transcript.length > MAX_TRANSCRIPT_CHARS
-            ? ["Transcript truncated for processing."]
-            : [],
+        warnings: transcript.length > MAX_TRANSCRIPT_CHARS ? ["Transcript truncated for processing."] : [],
       });
     } finally {
       await unlink(tmp).catch(() => {});
@@ -577,7 +878,9 @@ app.post(
  * Body:
  *  {
  *    transcript: string,
- *    segments?: {startMs,endMs,text}[]  // optional for timestamp evidence linking
+ *    segments?: {startMs,endMs,text}[],
+ *    enforceRedaction?: boolean,
+ *    enforceOutputSafety?: boolean
  *  }
  *
  * Returns: { subjective, objective, assessment, plan, evidence, entities?, warnings? }
@@ -588,22 +891,29 @@ app.post(
     const Body = z.object({
       transcript: z.string().min(1).max(200_000),
       segments: z.array(SegmentSchema).optional(),
-      // Optional: demo setting to enforce redaction gate before cloud calls
+      // Optional: enforce redaction gate before cloud calls
       enforceRedaction: z.boolean().optional(),
+      // Optional: enforce output safety gate (PII detection on LLM output)
+      enforceOutputSafety: z.boolean().optional(),
     });
 
     const parsed = Body.safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ error: "Invalid body" });
 
-    let { transcript, segments, enforceRedaction } = parsed.data;
+    let { transcript, segments } = parsed.data;
+    const enforceRedaction = parsed.data.enforceRedaction ?? DEFAULT_ENFORCE_REDACTION;
+    const enforceOutputSafety = parsed.data.enforceOutputSafety ?? true;
+
     transcript = truncateForProcessing(transcript.trim(), MAX_TRANSCRIPT_CHARS);
 
     // no-PII logging: only length
     req.log.info({ route: "/clinician/soap", textLen: transcript.length }, "soap");
 
     // Optional PHI gate (best effort)
+    let piiDetectedInput = false;
     if (enforceRedaction) {
       const { piiDetected } = await redactTextBestEffort(transcript);
+      piiDetectedInput = piiDetected;
       if (piiDetected) {
         return res.status(400).json({
           error: "PII detected. Please redact before generating SOAP.",
@@ -680,12 +990,38 @@ Rules:
     const entities = await extractHealthcareEntitiesBestEffort(transcript);
     if (!entities) warnings.push("Healthcare entity extraction unavailable or not configured.");
 
-    return res.json({
+    // 4) output safety gate (PII on response) – redact or block
+    let piiDetectedOutput = false;
+    let responsePayload: any = {
       ...soap,
       evidence,
       entities,
       warnings: warnings.length ? warnings : undefined,
-    });
+      trust: {
+        ...computeTrustFromEvidence(evidence),
+        piiDetectedInput,
+      },
+    };
+
+    if (enforceOutputSafety && OUTPUT_PII_MODE !== "off") {
+      const { redacted, piiDetected } = await redactStringsBestEffort(responsePayload);
+      piiDetectedOutput = piiDetected;
+
+      if (piiDetectedOutput && OUTPUT_PII_MODE === "block") {
+        return res.status(400).json({
+          error: "PII detected in generated output. Please adjust input and try again.",
+          code: "PII_DETECTED_OUTPUT",
+        });
+      }
+
+      responsePayload = redacted;
+      responsePayload.trust = {
+        ...(responsePayload.trust ?? {}),
+        piiDetectedOutput,
+      };
+    }
+
+    return res.json(responsePayload);
   })
 );
 
@@ -699,15 +1035,14 @@ app.post(
     const parsed = Body.safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ error: "Invalid body" });
 
-    const trend = parsed.data.diary
-      .slice()
-      .sort((a, b) => a.date.localeCompare(b.date))
-      .map((e) => ({
-        date: e.date.slice(0, 10),
-        symptomScore: e.symptomScore,
-        sleepHours: e.sleepHours,
-        moodScore: e.moodScore,
-      }));
+    const diary = normalizeDiary(parsed.data.diary);
+
+    const trend = diary.map((e) => ({
+      date: e.date,
+      symptomScore: e.symptomScore,
+      sleepHours: e.sleepHours,
+      moodScore: e.moodScore,
+    }));
 
     // no content logging
     req.log.info({ route: "/diary/trends", count: trend.length }, "trends");
@@ -717,42 +1052,139 @@ app.post(
 );
 
 /**
- * Patient diary: POST /diary/summarize  { diary: DiaryEntry[] }
- * Deterministic summary for hackathon stability.
- * (You can later swap to Azure OpenAI while keeping the response shape.)
+ * Patient diary: POST /diary/summarize
+ * Body:
+ *  {
+ *    diary: DiaryEntry[],
+ *    enforceRedaction?: boolean,
+ *    enforceOutputSafety?: boolean
+ *  }
+ *
+ * Returns:
+ *  { summary: DiarySummary, warnings?: string[] }
+ *
+ * Upgrades:
+ * - Uses Azure OpenAI when configured (fallback deterministic).
+ * - Adds evidence links + Trust score.
+ * - Optional PHI gates (input + output). Output mode controlled by OUTPUT_PII_MODE.
  */
 app.post(
   "/diary/summarize",
   asyncHandler(async (req, res) => {
-    const Body = z.object({ diary: z.array(DiaryEntrySchema).max(365) });
+    const Body = z.object({
+      diary: z.array(DiaryEntrySchema).max(365),
+      enforceRedaction: z.boolean().optional(),
+      enforceOutputSafety: z.boolean().optional(),
+    });
+
     const parsed = Body.safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ error: "Invalid body" });
 
-    const diary = parsed.data.diary.slice().sort((a, b) => a.date.localeCompare(b.date));
-    const last7 = diary.slice(-7);
-    const avg = last7.length ? last7.reduce((s, e) => s + e.symptomScore, 0) / last7.length : null;
+    const enforceRedaction = parsed.data.enforceRedaction ?? DEFAULT_ENFORCE_REDACTION;
+    const enforceOutputSafety = parsed.data.enforceOutputSafety ?? true;
+
+    const diary = normalizeDiary(parsed.data.diary);
 
     // no content logging
     req.log.info({ route: "/diary/summarize", count: diary.length }, "summarize");
 
-    const summary = {
-      headline: diary.length ? "Pre-visit summary (server)" : "Add diary entries to generate a summary",
-      bullets: diary.length
-        ? [
-            avg != null ? `Last 7 days avg symptom score: ${avg.toFixed(1)} / 10` : "Not enough data for a 7-day average",
-            "Patterns are hints only (not a diagnosis).",
-          ]
-        : [],
-      possibleTriggers: Array.from(
-        new Set(last7.flatMap((e) => (e.tags ?? []).map((t) => t.toLowerCase())).filter(Boolean))
-      ).slice(0, 5),
-      gentleSuggestions: diary.length
-        ? ["Keep logging meals/sleep alongside symptoms.", "If symptoms worsen, consider contacting a clinician."]
-        : [],
-      last7DaysAvgSymptom: avg,
+    if (!diary.length) {
+      const empty = deterministicDiarySummary(diary);
+      return res.json({ summary: empty });
+    }
+
+    // Optional input PHI gate (best effort)
+    let piiDetectedInput = false;
+    if (enforceRedaction) {
+      const allNotes = diary
+        .map((e) => e.notes ?? "")
+        .filter(Boolean)
+        .join("\n")
+        .slice(0, 20_000);
+
+      if (allNotes) {
+        const { piiDetected } = await redactTextBestEffort(allNotes);
+        piiDetectedInput = piiDetected;
+        if (piiDetected) {
+          return res.status(400).json({
+            error: "PII detected in diary notes. Please redact before generating a summary.",
+            code: "PII_DETECTED",
+          });
+        }
+      }
+    }
+
+    const azure = makeAzureOpenAI();
+    let warnings: string[] = [];
+    let mode: "llm" | "deterministic" = "deterministic";
+
+    // 1) generate summary (LLM if configured; else deterministic)
+    let summary: DiarySummary | null = null;
+
+    if (azure) {
+      try {
+        const s = await llmDiarySummary(diary, azure);
+        if (s) {
+          summary = s;
+          mode = "llm";
+        } else {
+          warnings.push("Model summary unavailable; falling back to deterministic summary.");
+        }
+      } catch {
+        warnings.push("Model summary failed; falling back to deterministic summary.");
+      }
+    } else {
+      warnings.push("Azure OpenAI not configured; using deterministic summary.");
+    }
+
+    if (!summary) summary = deterministicDiarySummary(diary);
+
+    // 2) evidence linking + trust
+    const evidence = buildDiaryEvidence(summary, diary);
+    const trustCore = computeTrustFromEvidence(evidence);
+
+    summary.evidence = evidence;
+    summary.trust = {
+      scorePct: trustCore.scorePct,
+      verified: trustCore.verified,
+      unverified: trustCore.unverified,
+      piiDetectedInput,
+      mode,
     };
 
-    return res.json({ summary });
+    // 3) output safety gate (PII on response) – redact or block
+    let piiDetectedOutput = false;
+
+    if (enforceOutputSafety && OUTPUT_PII_MODE !== "off") {
+      const { redacted, piiDetected } = await redactStringsBestEffort(summary as any);
+      piiDetectedOutput = piiDetected;
+
+      if (piiDetectedOutput && OUTPUT_PII_MODE === "block") {
+        return res.status(400).json({
+          error: "PII detected in generated output. Please adjust diary content and try again.",
+          code: "PII_DETECTED_OUTPUT",
+        });
+      }
+
+      summary = redacted as DiarySummary;
+      summary.trust = {
+        ...(summary.trust ?? trustCore),
+        piiDetectedOutput,
+        mode,
+        piiDetectedInput,
+      };
+    }
+
+    // 4) validate final shape (sanity)
+    const finalParsed = DiarySummarySchema.safeParse(summary);
+    if (!finalParsed.success) {
+      return res.status(502).json({ error: "Diary summary schema mismatch" });
+    }
+
+    return res.json({
+      summary: finalParsed.data,
+      warnings: warnings.length ? warnings : undefined,
+    });
   })
 );
 
@@ -785,6 +1217,9 @@ app.listen(port, () => {
       openai: Boolean(process.env.AZURE_OPENAI_ENDPOINT && process.env.AZURE_OPENAI_KEY && process.env.AZURE_OPENAI_DEPLOYMENT),
       speech: Boolean(process.env.AZURE_SPEECH_KEY && process.env.AZURE_SPEECH_REGION),
       textAnalytics: Boolean(process.env.AZURE_LANGUAGE_ENDPOINT && process.env.AZURE_LANGUAGE_KEY),
+      outputPiiMode: OUTPUT_PII_MODE,
+      defaultEnforceRedaction: DEFAULT_ENFORCE_REDACTION,
+      diaryMaxEntries: DIARY_SUMMARY_MAX_ENTRIES,
     },
     "careloop api listening"
   );
