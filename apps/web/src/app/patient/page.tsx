@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { z } from "zod";
@@ -14,63 +14,6 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
-
-// ---------------- types ----------------
-type DiaryEntry = {
-  date: string; // YYYY-MM-DD
-  symptomScore: number; // 0-10
-  sleepHours: number; // 0-24
-  moodScore: number; // 0-10
-  notes: string;
-  tags?: string[];
-};
-
-type TrendPoint = {
-  date: string;
-  symptomScore: number;
-  sleepHours: number;
-  moodScore: number;
-};
-
-type EvidenceRef = {
-  entryDate?: string; // YYYY-MM-DD
-  entryIndex?: number;
-  snippet?: string;
-  tag?: string;
-  score?: number;
-};
-
-type SummaryItem = {
-  text: string;
-  verified: boolean | null; // null = unknown
-  evidence: EvidenceRef[];
-};
-
-type DiarySummary = {
-  headline: string;
-  bullets: SummaryItem[];
-  possibleTriggers: SummaryItem[];
-  gentleSuggestions: SummaryItem[];
-  questionsForVisit?: string[];
-  redFlags?: string[];
-  last7DaysAvgSymptom: number | null;
-};
-
-type TrustReport = {
-  scorePct: number; // 0-100
-  verifiedCount: number;
-  unverifiedCount: number;
-  totalItems: number;
-  piiDetected: boolean;
-  notes: string[];
-};
-
-type TaskItem = {
-  id: string;
-  text: string;
-  done: boolean;
-  updatedAt?: number;
-};
 
 // ---------------- storage keys ----------------
 const LS_KEYS = {
@@ -91,15 +34,17 @@ const DiaryEntrySchema = z.object({
   tags: z.array(z.string()).optional(),
 });
 
+const TrendPointSchema = z.object({
+  date: z.string(),
+  symptomScore: z.number(),
+  sleepHours: z.number(),
+  moodScore: z.number(),
+  // forward-compatible: backend may later return it; UI also computes locally if absent
+  sentimentScore: z.number().min(-1).max(1).optional(),
+});
+
 const TrendResponseSchema = z.object({
-  trend: z.array(
-    z.object({
-      date: z.string(),
-      symptomScore: z.number(),
-      sleepHours: z.number(),
-      moodScore: z.number(),
-    })
-  ),
+  trend: z.array(TrendPointSchema),
 });
 
 const EvidenceRefSchema = z.object({
@@ -162,6 +107,62 @@ const TranscribeResponseSchema = z.object({
   warnings: z.array(z.string()).optional(),
 });
 
+// ---------------- types ----------------
+type DiaryEntry = {
+  date: string; // YYYY-MM-DD
+  symptomScore: number; // 0-10
+  sleepHours: number; // 0-24
+  moodScore: number; // 0-10
+  notes: string;
+  tags?: string[];
+};
+
+type TrendPoint = z.infer<typeof TrendPointSchema>;
+
+type EvidenceRef = {
+  entryDate?: string; // YYYY-MM-DD
+  entryIndex?: number;
+  snippet?: string;
+  tag?: string;
+  score?: number;
+};
+
+type SummaryItem = {
+  text: string;
+  verified: boolean | null; // null = unknown
+  evidence: EvidenceRef[];
+};
+
+type DiarySummary = {
+  headline: string;
+  bullets: SummaryItem[];
+  possibleTriggers: SummaryItem[];
+  gentleSuggestions: SummaryItem[];
+  questionsForVisit?: string[];
+  redFlags?: string[];
+  last7DaysAvgSymptom: number | null;
+};
+
+type TrustReport = {
+  scorePct: number; // 0-100
+  verifiedCount: number;
+  unverifiedCount: number;
+  totalItems: number;
+  piiDetected: boolean;
+  notes: string[];
+};
+
+type TaskItem = {
+  id: string;
+  text: string;
+  done: boolean;
+  updatedAt?: number;
+};
+
+type RedactionMode = "local" | "api" | "none";
+
+type ApiError = Error & { status?: number; payload?: any };
+
 // ---------------- helpers ----------------
 function clamp(n: number, lo: number, hi: number) {
   return Math.max(lo, Math.min(hi, n));
@@ -183,17 +184,28 @@ function safeJsonParse<T>(s: string): T | null {
   }
 }
 
+function safeJsonParseUnknown(s: string): unknown | null {
+  try {
+    return JSON.parse(s);
+  } catch {
+    return null;
+  }
+}
+
 function normalizeDiary(entries: DiaryEntry[]): DiaryEntry[] {
   const cleaned = entries
     .filter((e) => !!e?.date)
     .map((e) => ({
       date: String(e.date).slice(0, 10),
-      symptomScore: clamp(Number(e.symptomScore ?? 0), 0, 10),
-      sleepHours: clamp(Number(e.sleepHours ?? 0), 0, 24),
-      moodScore: clamp(Number(e.moodScore ?? 0), 0, 10),
-      notes: String(e.notes ?? "").slice(0, 4000),
-      tags: Array.isArray(e.tags)
-        ? e.tags.map((t) => String(t).trim()).filter(Boolean).slice(0, 12)
+      symptomScore: clamp(Number((e as any).symptomScore ?? 0), 0, 10),
+      sleepHours: clamp(Number((e as any).sleepHours ?? 0), 0, 24),
+      moodScore: clamp(Number((e as any).moodScore ?? 0), 0, 10),
+      notes: String((e as any).notes ?? "").slice(0, 4000),
+      tags: Array.isArray((e as any).tags)
+        ? (e as any).tags
+            .map((t: any) => String(t).trim())
+            .filter(Boolean)
+            .slice(0, 12)
         : [],
     }))
     .sort((a, b) => a.date.localeCompare(b.date));
@@ -202,15 +214,6 @@ function normalizeDiary(entries: DiaryEntry[]): DiaryEntry[] {
   const byDate = new Map<string, DiaryEntry>();
   for (const e of cleaned) byDate.set(e.date, e);
   return Array.from(byDate.values()).sort((a, b) => a.date.localeCompare(b.date));
-}
-
-function computeLocalTrends(diary: DiaryEntry[]): TrendPoint[] {
-  return diary.map((e) => ({
-    date: e.date,
-    symptomScore: e.symptomScore,
-    sleepHours: e.sleepHours,
-    moodScore: e.moodScore,
-  }));
 }
 
 function avg(nums: number[]): number | null {
@@ -243,77 +246,97 @@ function extractTagStats(diary: DiaryEntry[]) {
 
 function localRedact(text: string): string {
   let t = text;
+
+  // email
   t = t.replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, "[REDACTED_EMAIL]");
+
+  // phone-ish
   t = t.replace(
     /(\+?\d{1,3}[\s-]?)?(\(?\d{2,3}\)?[\s-]?)?\d{3}[\s-]?\d{3,4}\b/g,
     "[REDACTED_PHONE]"
   );
+
+  // address-ish (very heuristic)
   t = t.replace(
     /\b(\d{1,4}\s+)?[A-Za-zÀ-ž.'-]+\s+(street|st|road|rd|ave|avenue|utca|u\.|út|krt\.|körút)\b/gi,
     "[REDACTED_ADDR]"
   );
+
   return t;
 }
 
-type ApiError = Error & { status?: number; payload?: any };
-
-async function apiPost<T>(path: string, body: unknown): Promise<T> {
-  const res = await fetch(`/api${path}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-
-  const text = await res.text();
-  const json = text ? (JSON.parse(text) as any) : null;
-
-  if (!res.ok) {
-    const msg = json?.error ? String(json.error) : `API ${path} failed: ${res.status}`;
-    const err = new Error(msg) as ApiError;
-    err.status = res.status;
-    err.payload = json;
-    throw err;
-  }
-
-  return json as T;
+function detectLikelyPii(text: string): boolean {
+  if (!text.trim()) return false;
+  const email = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i.test(text);
+  const phone = /(\+?\d{1,3}[\s-]?)?(\(?\d{2,3}\)?[\s-]?)?\d{3}[\s-]?\d{3,4}\b/.test(text);
+  const addr =
+    /\b(\d{1,4}\s+)?[A-Za-zÀ-ž.'-]+\s+(street|st|road|rd|ave|avenue|utca|u\.|út|krt\.|körút)\b/i.test(text);
+  return email || phone || addr;
 }
 
-async function apiPostForm<T>(path: string, form: FormData): Promise<T> {
-  const res = await fetch(`/api${path}`, { method: "POST", body: form });
-  const text = await res.text();
-  const json = text ? (JSON.parse(text) as any) : null;
-
-  if (!res.ok) {
-    const msg = json?.error ? String(json.error) : `API ${path} failed: ${res.status}`;
-    const err = new Error(msg) as ApiError;
-    err.status = res.status;
-    err.payload = json;
-    throw err;
-  }
-
-  return json as T;
-}
-
-function downloadJson(filename: string, obj: unknown) {
-  const blob = new Blob([JSON.stringify(obj, null, 2)], { type: "application/json" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  URL.revokeObjectURL(url);
-}
-
+// tiny stable hash (not crypto)
 function stableId(text: string) {
-  // tiny stable hash (not crypto)
   let h = 2166136261;
   for (let i = 0; i < text.length; i++) {
     h ^= text.charCodeAt(i);
     h = Math.imul(h, 16777619);
   }
   return `t_${(h >>> 0).toString(16)}`;
+}
+
+// very small, local-only sentiment heuristic: returns -1..1 (null if no text)
+function localSentimentScore(text: string): number | null {
+  const t = String(text ?? "").toLowerCase().trim();
+  if (!t) return null;
+
+  const pos = [
+    "better",
+    "improved",
+    "improving",
+    "good",
+    "great",
+    "calm",
+    "rested",
+    "relief",
+    "helped",
+    "ok",
+    "fine",
+  ];
+  const neg = [
+    "worse",
+    "worsening",
+    "bad",
+    "awful",
+    "pain",
+    "cramp",
+    "nausea",
+    "vomit",
+    "anxious",
+    "panic",
+    "tired",
+    "insomnia",
+    "severe",
+    "dizzy",
+  ];
+
+  let score = 0;
+  for (const w of pos) if (t.includes(w)) score += 1;
+  for (const w of neg) if (t.includes(w)) score -= 1;
+
+  // cap & normalize
+  const capped = clamp(score, -5, 5);
+  const normalized = capped / 5; // -1..1
+  return normalized;
+}
+
+function computeLocalTrends(diary: DiaryEntry[]): TrendPoint[] {
+  return diary.map((e) => ({
+    date: e.date,
+    symptomScore: e.symptomScore,
+    sleepHours: e.sleepHours,
+    moodScore: e.moodScore,
+    sentimentScore: localSentimentScore(e.notes) ?? undefined,
+  }));
 }
 
 function computeInsights(diary: DiaryEntry[]) {
@@ -359,8 +382,6 @@ function computeInsights(diary: DiaryEntry[]) {
   };
 }
 
-type RedactionMode = "local" | "api" | "none";
-
 function normalizeSummaryItem(x: unknown): SummaryItem {
   if (typeof x === "string") return { text: x, verified: null, evidence: [] };
 
@@ -380,6 +401,38 @@ function normalizeSummaryItem(x: unknown): SummaryItem {
     : [];
 
   return { text: text || "(missing text)", verified, evidence };
+}
+
+function computeTrust(summary: DiarySummary): TrustReport {
+  const items = [
+    ...(summary.bullets ?? []),
+    ...(summary.possibleTriggers ?? []),
+    ...(summary.gentleSuggestions ?? []),
+  ];
+
+  const totalItems = items.length;
+
+  // Heuristic: "verified" if (a) verified===true OR (b) evidence exists and verified!==false
+  const verifiedCount = items.filter((i) =>
+    i.verified === true ? true : i.verified === false ? false : (i.evidence?.length ?? 0) > 0
+  ).length;
+
+  const unverifiedCount = Math.max(0, totalItems - verifiedCount);
+  const scorePct = totalItems ? Math.round((verifiedCount / totalItems) * 100) : 0;
+
+  const notes: string[] = [];
+  if (!totalItems) notes.push("No items to score yet.");
+  else if (verifiedCount === 0) notes.push("No evidence links provided (yet). Add evidence-backed items for higher trust.");
+  else if (verifiedCount < totalItems) notes.push("Some items lack evidence links. Treat as hints only.");
+
+  return {
+    scorePct,
+    verifiedCount,
+    unverifiedCount,
+    totalItems,
+    piiDetected: false,
+    notes,
+  };
 }
 
 function normalizeSummaryFromApi(parsed: z.infer<typeof SummaryResponseSchema>): {
@@ -422,38 +475,6 @@ function normalizeSummaryFromApi(parsed: z.infer<typeof SummaryResponseSchema>):
   return { summary, trust, meta };
 }
 
-function computeTrust(summary: DiarySummary): TrustReport {
-  const items = [
-    ...(summary.bullets ?? []),
-    ...(summary.possibleTriggers ?? []),
-    ...(summary.gentleSuggestions ?? []),
-  ];
-
-  const totalItems = items.length;
-
-  // Heuristic: "verified" if (a) verified===true OR (b) evidence exists and verified!==false
-  const verifiedCount = items.filter((i) => (i.verified === true ? true : i.verified === false ? false : i.evidence.length > 0))
-    .length;
-
-  const unverifiedCount = Math.max(0, totalItems - verifiedCount);
-
-  const scorePct = totalItems ? Math.round((verifiedCount / totalItems) * 100) : 0;
-
-  const notes: string[] = [];
-  if (!totalItems) notes.push("No items to score yet.");
-  else if (verifiedCount === 0) notes.push("No evidence links provided (yet). Add evidence-backed summary for higher trust.");
-  else if (verifiedCount < totalItems) notes.push("Some items lack evidence links. Treat as hints only.");
-
-  return {
-    scorePct,
-    verifiedCount,
-    unverifiedCount,
-    totalItems,
-    piiDetected: false,
-    notes,
-  };
-}
-
 function formatEvidence(e: EvidenceRef) {
   const bits: string[] = [];
   if (e.entryDate) bits.push(e.entryDate);
@@ -463,21 +484,68 @@ function formatEvidence(e: EvidenceRef) {
 }
 
 function summaryToStoragePayload(summary: DiarySummary, trust: TrustReport) {
-  return {
-    summary,
-    trust,
-    generatedAt: Date.now(),
-  };
+  return { summary, trust, generatedAt: Date.now() };
+}
+
+function downloadJson(filename: string, obj: unknown) {
+  const blob = new Blob([JSON.stringify(obj, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+async function apiPost<T>(path: string, body: unknown, signal?: AbortSignal): Promise<T> {
+  const res = await fetch(`/api${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    signal,
+  });
+
+  const text = await res.text();
+  const json = text ? safeJsonParseUnknown(text) : null;
+
+  if (!res.ok) {
+    const msg = (json as any)?.error ? String((json as any).error) : `API ${path} failed: ${res.status}`;
+    const err = new Error(msg) as ApiError;
+    err.status = res.status;
+    err.payload = json;
+    throw err;
+  }
+
+  return json as T;
+}
+
+async function apiPostForm<T>(path: string, form: FormData, signal?: AbortSignal): Promise<T> {
+  const res = await fetch(`/api${path}`, { method: "POST", body: form, signal });
+  const text = await res.text();
+  const json = text ? safeJsonParseUnknown(text) : null;
+
+  if (!res.ok) {
+    const msg = (json as any)?.error ? String((json as any).error) : `API ${path} failed: ${res.status}`;
+    const err = new Error(msg) as ApiError;
+    err.status = res.status;
+    err.payload = json;
+    throw err;
+  }
+
+  return json as T;
 }
 
 // best-effort: redact only notes; numbers/tags are safe-ish synthetic fields
-async function prepareDiaryForApi(diary: DiaryEntry[], mode: RedactionMode) {
+async function prepareDiaryForApi(diary: DiaryEntry[], mode: RedactionMode, signal?: AbortSignal) {
   if (mode === "none") return { diary, piiDetected: false };
 
   if (mode === "local") {
+    const piiDetected = diary.some((e) => detectLikelyPii(e.notes));
     return {
       diary: diary.map((e) => ({ ...e, notes: localRedact(e.notes) })),
-      piiDetected: false,
+      piiDetected,
     };
   }
 
@@ -493,13 +561,18 @@ async function prepareDiaryForApi(diary: DiaryEntry[], mode: RedactionMode) {
       continue;
     }
     const payloadText = note.slice(0, 20000);
-    const resp = await apiPost<{ redacted: string; piiDetected?: boolean }>("/privacy/redact", {
-      text: payloadText,
-    });
-    const parsed = RedactResponseSchema.safeParse(resp);
-    const redacted = parsed.success ? parsed.data.redacted : localRedact(payloadText);
-    piiDetectedAny = piiDetectedAny || Boolean(parsed.success && parsed.data.piiDetected);
-    redactedNotes.push(redacted);
+
+    try {
+      const resp = await apiPost<unknown>("/privacy/redact", { text: payloadText }, signal);
+      const parsed = RedactResponseSchema.safeParse(resp);
+      const redacted = parsed.success ? parsed.data.redacted : localRedact(payloadText);
+      piiDetectedAny = piiDetectedAny || Boolean(parsed.success && parsed.data.piiDetected);
+      redactedNotes.push(redacted);
+    } catch {
+      // fallback per-note if API is flaky
+      redactedNotes.push(localRedact(payloadText));
+      piiDetectedAny = piiDetectedAny || detectLikelyPii(payloadText);
+    }
   }
 
   const merged = diary
@@ -521,12 +594,7 @@ export default function PatientPage() {
   const [trust, setTrust] = useState<TrustReport | null>(null);
   const [summaryGeneratedAt, setSummaryGeneratedAt] = useState<number | null>(null);
 
-  const [busy, setBusy] = useState<{
-    trends: boolean;
-    summary: boolean;
-    transcribe: boolean;
-    redact: boolean;
-  }>({
+  const [busy, setBusy] = useState({
     trends: false,
     summary: false,
     transcribe: false,
@@ -548,6 +616,9 @@ export default function PatientPage() {
   const [audioFile, setAudioFile] = useState<File | null>(null);
   const [sttWarnings, setSttWarnings] = useState<string[]>([]);
 
+  // Sentiment UI (optional)
+  const [showSentiment, setShowSentiment] = useState<boolean>(false);
+
   // Entry form
   const [form, setForm] = useState<DiaryEntry>({
     date: todayISO(),
@@ -559,10 +630,22 @@ export default function PatientPage() {
   });
   const [tagInput, setTagInput] = useState("");
 
-  // Tasks refresh token (fix: useMemo needs a changing dep to re-read localStorage)
+  // Tasks refresh token (forces re-read localStorage)
   const [tasksRefreshToken, setTasksRefreshToken] = useState(0);
 
-  // Tasks + adherence state
+  // Abort controllers for in-flight requests
+  const trendsAbortRef = useRef<AbortController | null>(null);
+  const summaryAbortRef = useRef<AbortController | null>(null);
+  const sttAbortRef = useRef<AbortController | null>(null);
+
+  useEffect(() => {
+    return () => {
+      trendsAbortRef.current?.abort();
+      summaryAbortRef.current?.abort();
+      sttAbortRef.current?.abort();
+    };
+  }, []);
+
   const tasksRaw = useMemo(() => {
     try {
       const raw = typeof window !== "undefined" ? localStorage.getItem(LS_KEYS.tasks) : null;
@@ -586,13 +669,8 @@ export default function PatientPage() {
   const tasks: TaskItem[] = useMemo(() => {
     return tasksRaw.slice(0, 50).map((t) => {
       const id = stableId(t);
-      const state = tasksStateRaw[id];
-      return {
-        id,
-        text: t,
-        done: Boolean(state?.done),
-        updatedAt: state?.updatedAt,
-      };
+      const state = (tasksStateRaw as any)[id];
+      return { id, text: t, done: Boolean(state?.done), updatedAt: state?.updatedAt };
     });
   }, [tasksRaw, tasksStateRaw]);
 
@@ -604,7 +682,7 @@ export default function PatientPage() {
   }, [tasks]);
 
   useEffect(() => {
-    // Load diary from localStorage if present
+    // Load diary
     try {
       const raw = localStorage.getItem(LS_KEYS.diary);
       if (raw) {
@@ -621,7 +699,7 @@ export default function PatientPage() {
       // ignore
     }
 
-    // Load last summary (v2)
+    // Load cached summary
     try {
       const raw = localStorage.getItem(LS_KEYS.preVisitSummary);
       if (raw) {
@@ -641,27 +719,27 @@ export default function PatientPage() {
     setTrend(computeLocalTrends(diary));
   }, [diary]);
 
-  function persistDiary(next: DiaryEntry[]) {
+  const persistDiary = useCallback((next: DiaryEntry[]) => {
     setDiary(next);
     try {
       localStorage.setItem(LS_KEYS.diary, JSON.stringify(next));
     } catch {
       // ignore
     }
-  }
+  }, []);
 
-  function addTag(tag: string) {
+  const addTag = useCallback((tag: string) => {
     const t = tag.trim();
     if (!t) return;
     const nextTags = Array.from(new Set([...(form.tags ?? []), t])).slice(0, 12);
     setForm((f) => ({ ...f, tags: nextTags }));
-  }
+  }, [form.tags]);
 
-  function removeTag(tag: string) {
+  const removeTag = useCallback((tag: string) => {
     setForm((f) => ({ ...f, tags: (f.tags ?? []).filter((x) => x !== tag) }));
-  }
+  }, []);
 
-  function addEntry() {
+  const addEntry = useCallback(() => {
     setErr(null);
     setNotes([]);
 
@@ -691,29 +769,32 @@ export default function PatientPage() {
 
     const next = normalizeDiary([...diary, entry]);
     persistDiary(next);
-    setForm((f) => ({ ...f, date: todayISO(), notes: "" }));
-  }
 
-  function deleteEntry(date: string) {
+    setForm((f) => ({ ...f, date: todayISO(), notes: "" }));
+  }, [diary, form, persistDiary]);
+
+  const deleteEntry = useCallback((date: string) => {
     const next = diary.filter((e) => e.date !== date);
     persistDiary(next);
-  }
+  }, [diary, persistDiary]);
 
-  function clearDiaryOnly() {
+  const clearDiaryOnly = useCallback(() => {
     setErr(null);
     setNotes([]);
     setSummary(null);
     setTrust(null);
     setSummaryGeneratedAt(null);
+    setTrend([]);
     persistDiary([]);
     try {
       localStorage.removeItem(LS_KEYS.diary);
+      localStorage.removeItem(LS_KEYS.preVisitSummary);
     } catch {
       // ignore
     }
-  }
+  }, [persistDiary]);
 
-  function clearAllDemoData() {
+  const clearAllDemoData = useCallback(() => {
     setErr(null);
     setNotes([]);
     setSummary(null);
@@ -726,60 +807,104 @@ export default function PatientPage() {
       localStorage.removeItem(LS_KEYS.tasks);
       localStorage.removeItem(LS_KEYS.tasksState);
       localStorage.removeItem(LS_KEYS.preVisitSummary);
-      // keep transcript if you want; but for hard reset, remove it:
       // localStorage.removeItem(LS_KEYS.transcript);
     } catch {
       // ignore
     }
     setTasksRefreshToken((x) => x + 1);
-  }
+  }, []);
 
-  async function refreshTrends() {
-    setErr(null);
-    setNotes([]);
-    setBusy((b) => ({ ...b, trends: true }));
-
-    try {
-      const { diary: payloadDiary, piiDetected } = await prepareDiaryForApi(diary, redactionMode);
-      if (piiDetected) setNotes((n) => [...n, "PII detected and redacted (best-effort) before processing."]);
-
-      const resp = await apiPost<unknown>("/diary/trends", { diary: payloadDiary });
-      const parsed = TrendResponseSchema.safeParse(resp);
-
-      if (parsed.success) setTrend(parsed.data.trend);
-      else setTrend(computeLocalTrends(diary));
-    } catch {
-      setTrend(computeLocalTrends(diary));
-      setNotes((n) => [...n, "API unavailable — trends computed locally (demo fallback)."]);
-    } finally {
-      setBusy((b) => ({ ...b, trends: false }));
-    }
-  }
-
-  function explainPiiGateFailure() {
+  const explainPiiGateFailure = useCallback(() => {
     setNotes((n) => [
       ...n,
       "Safety gate blocked generation: possible PII/PHI detected.",
       "Tip: switch Redaction to Local/API, then retry. Keep content synthetic in demos.",
     ]);
-  }
+  }, []);
 
-  async function generateSummary() {
+  const refreshTrends = useCallback(async () => {
+    setErr(null);
+    setNotes([]);
+    setBusy((b) => ({ ...b, trends: true }));
+
+    trendsAbortRef.current?.abort();
+    trendsAbortRef.current = new AbortController();
+
+    try {
+      if (enforcePhiGate && redactionMode === "none") {
+        const anyPii = diary.some((e) => detectLikelyPii(e.notes));
+        if (anyPii) {
+          explainPiiGateFailure();
+          return;
+        }
+      }
+
+      const { diary: payloadDiary, piiDetected } = await prepareDiaryForApi(
+        diary,
+        redactionMode,
+        trendsAbortRef.current.signal
+      );
+      if (piiDetected) setNotes((n) => [...n, "PII detected and redacted (best-effort) before processing."]);
+
+      const resp = await apiPost<unknown>("/diary/trends", { diary: payloadDiary }, trendsAbortRef.current.signal);
+      const parsed = TrendResponseSchema.safeParse(resp);
+
+      if (parsed.success) {
+        // merge local sentiment if API doesn’t return it
+        const localByDate = new Map(computeLocalTrends(diary).map((p) => [p.date, p]));
+        const merged = parsed.data.trend.map((p) => ({
+          ...p,
+          sentimentScore: p.sentimentScore ?? localByDate.get(p.date)?.sentimentScore,
+        }));
+        setTrend(merged);
+      } else {
+        setTrend(computeLocalTrends(diary));
+      }
+    } catch (e) {
+      if ((e as any)?.name !== "AbortError") {
+        setTrend(computeLocalTrends(diary));
+        setNotes((n) => [...n, "API unavailable — trends computed locally (demo fallback)."]);
+      }
+    } finally {
+      setBusy((b) => ({ ...b, trends: false }));
+    }
+  }, [diary, enforcePhiGate, explainPiiGateFailure, redactionMode]);
+
+  const generateSummary = useCallback(async () => {
     setErr(null);
     setNotes([]);
     setBusy((b) => ({ ...b, summary: true }));
 
+    summaryAbortRef.current?.abort();
+    summaryAbortRef.current = new AbortController();
+
     try {
-      const { diary: payloadDiary, piiDetected } = await prepareDiaryForApi(diary, redactionMode);
+      if (enforcePhiGate && redactionMode === "none") {
+        const anyPii = diary.some((e) => detectLikelyPii(e.notes));
+        if (anyPii) {
+          explainPiiGateFailure();
+          return;
+        }
+      }
+
+      const { diary: payloadDiary, piiDetected } = await prepareDiaryForApi(
+        diary,
+        redactionMode,
+        summaryAbortRef.current.signal
+      );
       if (piiDetected) setNotes((n) => [...n, "PII detected and redacted (best-effort) before processing."]);
 
-      const resp = await apiPost<unknown>("/diary/summarize", {
-        diary: payloadDiary,
-        // backend can ignore these (forward compatible)
-        enforceRedaction: enforcePhiGate,
-        redactOutput: redactOutput,
-        windowDays,
-      });
+      const resp = await apiPost<unknown>(
+        "/diary/summarize",
+        {
+          diary: payloadDiary,
+          // backend can ignore these (forward compatible)
+          enforceRedaction: enforcePhiGate,
+          redactOutput: redactOutput,
+          windowDays,
+        },
+        summaryAbortRef.current.signal
+      );
 
       const parsed = SummaryResponseSchema.safeParse(resp);
       if (!parsed.success) throw new Error("Bad summary response");
@@ -809,6 +934,8 @@ export default function PatientPage() {
       }
       return;
     } catch (e) {
+      if ((e as any)?.name === "AbortError") return;
+
       const errObj = e as ApiError;
       const code = errObj?.payload?.code ? String(errObj.payload.code) : "";
       if (code === "PII_DETECTED") {
@@ -826,13 +953,11 @@ export default function PatientPage() {
         const triggers = Array.from(tagStats.entries())
           .filter(([, v]) => v.count >= 2)
           .sort((a, b) => b[1].avgSymptom - a[1].avgSymptom)
-          .slice(0, 3)
+          .slice(0, 4)
           .map(([k]) => k);
 
         const localSummary: DiarySummary = {
-          headline: diary.length
-            ? "Pre-visit summary (local fallback)"
-            : "Add a few diary entries to generate a summary",
+          headline: diary.length ? "Pre-visit summary (local fallback)" : "Add a few diary entries to generate a summary",
           bullets: diary.length
             ? [
                 {
@@ -856,11 +981,7 @@ export default function PatientPage() {
           possibleTriggers: triggers.map((t) => ({ text: t, verified: null, evidence: [] })),
           gentleSuggestions: diary.length
             ? [
-                {
-                  text: "Keep logging meals/sleep alongside symptoms for clearer patterns.",
-                  verified: null,
-                  evidence: [],
-                },
+                { text: "Keep logging meals/sleep alongside symptoms for clearer patterns.", verified: null, evidence: [] },
                 {
                   text: "If symptoms worsen or new red flags appear, consider contacting a clinician.",
                   verified: null,
@@ -899,9 +1020,9 @@ export default function PatientPage() {
     } finally {
       setBusy((b) => ({ ...b, summary: false }));
     }
-  }
+  }, [diary, enforcePhiGate, explainPiiGateFailure, redactOutput, redactionMode, windowDays]);
 
-  async function transcribeDiaryAudioIntoNotes() {
+  const transcribeDiaryAudioIntoNotes = useCallback(async () => {
     setErr(null);
     setNotes([]);
     setSttWarnings([]);
@@ -912,11 +1033,15 @@ export default function PatientPage() {
     }
 
     setBusy((b) => ({ ...b, transcribe: true }));
+
+    sttAbortRef.current?.abort();
+    sttAbortRef.current = new AbortController();
+
     try {
       const formData = new FormData();
       formData.append("audio", audioFile);
 
-      const resp = await apiPostForm<unknown>("/transcribe", formData);
+      const resp = await apiPostForm<unknown>("/transcribe", formData, sttAbortRef.current.signal);
       const parsed = TranscribeResponseSchema.safeParse(resp);
 
       if (!parsed.success) throw new Error("Bad STT response");
@@ -932,14 +1057,16 @@ export default function PatientPage() {
 
       if (parsed.data.warnings?.length) setSttWarnings(parsed.data.warnings);
       setNotes((n) => [...n, "Audio transcribed. Review notes and save as a diary entry."]);
-    } catch {
-      setErr("Transcription failed (or API not running). You can still type notes manually.");
+    } catch (e) {
+      if ((e as any)?.name !== "AbortError") {
+        setErr("Transcription failed (or API not running). You can still type notes manually.");
+      }
     } finally {
       setBusy((b) => ({ ...b, transcribe: false }));
     }
-  }
+  }, [audioFile]);
 
-  function toggleTaskDone(taskId: string) {
+  const toggleTaskDone = useCallback((taskId: string) => {
     try {
       const raw = localStorage.getItem(LS_KEYS.tasksState);
       const parsed = raw ? safeJsonParse<Record<string, { done: boolean; updatedAt?: number }>>(raw) : null;
@@ -951,15 +1078,26 @@ export default function PatientPage() {
     } catch {
       setErr("Could not save task state (browser policy/private mode).");
     }
-  }
+  }, []);
 
   const canAnalyze = diary.length >= 2;
+
   const windowedDiary = useMemo(() => lastNDays(diary, windowDays), [diary, windowDays]);
 
   const windowedTrend = useMemo(() => {
     const set = new Set(windowedDiary.map((e) => e.date));
     return trend.filter((p) => set.has(p.date));
   }, [trend, windowedDiary]);
+
+  const hasAnySentiment = useMemo(
+    () => windowedTrend.some((p) => typeof p.sentimentScore === "number"),
+    [windowedTrend]
+  );
+
+  useEffect(() => {
+    // auto-enable sentiment line if any data appears
+    if (hasAnySentiment) setShowSentiment(true);
+  }, [hasAnySentiment]);
 
   const insights = useMemo(() => computeInsights(diary), [diary]);
 
@@ -987,11 +1125,17 @@ export default function PatientPage() {
     }
 
     if (summary?.possibleTriggers?.length) {
-      const trig = summary.possibleTriggers.map((t) => t.text).filter(Boolean).slice(0, 8);
+      const trig = summary.possibleTriggers.map((t) => t.text).filter(Boolean).slice(0, 10);
       if (trig.length) {
         lines.push("");
         lines.push(`Possible triggers: ${trig.join(", ")}`);
       }
+    }
+
+    if (summary?.gentleSuggestions?.length) {
+      lines.push("");
+      lines.push("Suggestions (non-medical):");
+      for (const s of summary.gentleSuggestions.slice(0, 8)) lines.push(`- ${s.text}`);
     }
 
     if (summary?.questionsForVisit?.length) {
@@ -1013,45 +1157,44 @@ export default function PatientPage() {
     return lines.join("\n");
   }, [summary, insights, adherence, tasks, windowDays, trust]);
 
-  async function copyToClipboard(text: string) {
+  const copyToClipboard = useCallback(async (text: string) => {
     try {
       await navigator.clipboard.writeText(text);
       setNotes((n) => [...n, "Copied to clipboard."]);
     } catch {
       setErr("Clipboard not available in this browser context.");
     }
-  }
+  }, []);
 
-  function sendPreVisitToClinicianDemo() {
+  const sendPreVisitToClinicianDemo = useCallback(() => {
     try {
       localStorage.setItem(LS_KEYS.transcript, preVisitText);
       setNotes((n) => [...n, "Sent to Clinician mode (demo): transcript stored locally."]);
     } catch {
       setErr("Could not write to localStorage.");
     }
-  }
+  }, [preVisitText]);
 
-  function toggleEvidence(key: string) {
+  const toggleEvidence = useCallback((key: string) => {
     setExpandedEvidence((m) => ({ ...m, [key]: !m[key] }));
-  }
+  }, []);
 
-  function trustBadge() {
+  const trustBadge = useCallback(() => {
     if (!trust) return null;
-    const label =
-      trust.scorePct >= 75 ? "High confidence" : trust.scorePct >= 40 ? "Mixed confidence" : "Low confidence";
+    const label = trust.scorePct >= 75 ? "High confidence" : trust.scorePct >= 40 ? "Mixed confidence" : "Low confidence";
     return (
       <span className="rounded-full border border-slate-200 bg-white px-3 py-1 text-xs text-slate-700 shadow-sm">
         {label} • {trust.scorePct}%
       </span>
     );
-  }
+  }, [trust]);
 
   return (
     <main className="min-h-screen bg-gradient-to-b from-white to-slate-50">
       <div className="mx-auto max-w-6xl px-6 py-8">
         <header className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
           <div>
-            <div className="flex items-center gap-3">
+            <div className="flex flex-wrap items-center gap-3">
               <h1 className="text-3xl font-semibold tracking-tight text-slate-900">Patient mode</h1>
               <span className="rounded-full border border-slate-200 bg-white px-3 py-1 text-xs text-slate-700 shadow-sm">
                 Closed-loop • Synthetic-first
@@ -1059,8 +1202,7 @@ export default function PatientPage() {
               {tab === "diary" ? trustBadge() : null}
             </div>
             <p className="mt-2 max-w-2xl text-sm text-slate-700">
-              Log symptoms/sleep/mood and generate trends + an evidence-backed pre-visit summary. Tasks come from the
-              clinician SOAP Plan.
+              Log symptoms/sleep/mood and generate trends + an evidence-backed pre-visit summary. Tasks come from the clinician SOAP Plan.
             </p>
           </div>
 
@@ -1139,6 +1281,17 @@ export default function PatientPage() {
                 />
                 Redact model output (best-effort)
               </label>
+              {hasAnySentiment ? (
+                <label className="flex items-center gap-2 text-sm text-slate-700">
+                  <input
+                    type="checkbox"
+                    checked={showSentiment}
+                    onChange={(e) => setShowSentiment(e.target.checked)}
+                    className="h-4 w-4 rounded border-slate-300"
+                  />
+                  Show sentiment (demo)
+                </label>
+              ) : null}
             </div>
           ) : null}
 
@@ -1327,7 +1480,7 @@ export default function PatientPage() {
                 </div>
 
                 <p className="mt-2 text-sm text-slate-700">
-                  {canAnalyze ? "Visualize symptoms, sleep, and mood over time." : "Add at least 2 entries to see trends."}
+                  {canAnalyze ? "Visualize symptoms, sleep, mood — optional sentiment (demo) — over time." : "Add at least 2 entries to see trends."}
                 </p>
 
                 {insights.redFlag ? (
@@ -1341,12 +1494,30 @@ export default function PatientPage() {
                     <LineChart data={windowedTrend}>
                       <CartesianGrid strokeDasharray="3 3" />
                       <XAxis dataKey="date" tickMargin={8} />
-                      <YAxis tickMargin={8} />
-                      <Tooltip />
+                      <YAxis yAxisId="left" tickMargin={8} />
+                      {showSentiment && hasAnySentiment ? (
+                        <YAxis yAxisId="right" orientation="right" domain={[-1, 1]} tickMargin={8} />
+                      ) : null}
+                      <Tooltip
+                        formatter={(value: any, name: any) => {
+                          if (name === "Sentiment (-1..1)") return [Number(value).toFixed(2), name];
+                          if (typeof value === "number") return [value.toFixed(1), name];
+                          return [String(value), name];
+                        }}
+                      />
                       <Legend />
-                      <Line type="monotone" dataKey="symptomScore" name="Symptom (0-10)" dot={false} />
-                      <Line type="monotone" dataKey="sleepHours" name="Sleep (hours)" dot={false} />
-                      <Line type="monotone" dataKey="moodScore" name="Mood (0-10)" dot={false} />
+                      <Line yAxisId="left" type="monotone" dataKey="symptomScore" name="Symptom (0-10)" dot={false} />
+                      <Line yAxisId="left" type="monotone" dataKey="sleepHours" name="Sleep (hours)" dot={false} />
+                      <Line yAxisId="left" type="monotone" dataKey="moodScore" name="Mood (0-10)" dot={false} />
+                      {showSentiment && hasAnySentiment ? (
+                        <Line
+                          yAxisId="right"
+                          type="monotone"
+                          dataKey="sentimentScore"
+                          name="Sentiment (-1..1)"
+                          dot={false}
+                        />
+                      ) : null}
                     </LineChart>
                   </ResponsiveContainer>
                 </div>
@@ -1395,9 +1566,7 @@ export default function PatientPage() {
                           ({trust.verifiedCount}/{trust.totalItems})
                         </span>
                       </div>
-                      {trust.piiDetected ? (
-                        <div className="mt-1 text-[11px] text-amber-700">PII flagged</div>
-                      ) : null}
+                      {trust.piiDetected ? <div className="mt-1 text-[11px] text-amber-700">PII flagged</div> : null}
                     </div>
                   ) : null}
                 </div>
@@ -1485,7 +1654,10 @@ export default function PatientPage() {
                                     {hasEvidence ? (
                                       <ul className="space-y-2 text-xs text-slate-700">
                                         {b.evidence.slice(0, 5).map((e, j) => (
-                                          <li key={`${key}_e_${j}`} className="rounded-md border border-slate-200 bg-slate-50 px-2 py-1">
+                                          <li
+                                            key={`${key}_e_${j}`}
+                                            className="rounded-md border border-slate-200 bg-slate-50 px-2 py-1"
+                                          >
                                             <div className="text-[11px] font-semibold text-slate-700">
                                               {formatEvidence(e) || "Evidence"}
                                             </div>
@@ -1496,9 +1668,7 @@ export default function PatientPage() {
                                         ))}
                                       </ul>
                                     ) : (
-                                      <div className="text-xs text-slate-600">
-                                        No evidence returned for this item.
-                                      </div>
+                                      <div className="text-xs text-slate-600">No evidence returned for this item.</div>
                                     )}
                                   </div>
                                 ) : null}
@@ -1512,24 +1682,29 @@ export default function PatientPage() {
                     <div className="rounded-xl border border-slate-200 bg-white px-4 py-3">
                       <div className="text-xs font-semibold text-slate-700">Possible triggers</div>
                       <div className="mt-2 flex flex-wrap gap-2">
-                        {(summary.possibleTriggers?.length ? summary.possibleTriggers : [{ text: "—", verified: null, evidence: [] }]).slice(0, 10).map((t, i) => {
-                          const hasEvidence = (t.evidence?.length ?? 0) > 0;
-                          const label =
-                            t.verified === true || (t.verified == null && hasEvidence)
-                              ? "✓"
-                              : t.verified === false
-                              ? "?"
-                              : "•";
-                          return (
-                            <span
-                              key={`tr_${i}_${stableId(t.text)}`}
-                              className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs text-slate-700"
-                              title={hasEvidence ? "Evidence-linked" : "No evidence linked"}
-                            >
-                              {label} {t.text}
-                            </span>
-                          );
-                        })}
+                        {(summary.possibleTriggers?.length
+                          ? summary.possibleTriggers
+                          : [{ text: "—", verified: null, evidence: [] }]
+                        )
+                          .slice(0, 10)
+                          .map((t, i) => {
+                            const hasEvidence = (t.evidence?.length ?? 0) > 0;
+                            const label =
+                              t.verified === true || (t.verified == null && hasEvidence)
+                                ? "✓"
+                                : t.verified === false
+                                ? "?"
+                                : "•";
+                            return (
+                              <span
+                                key={`tr_${i}_${stableId(t.text)}`}
+                                className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs text-slate-700"
+                                title={hasEvidence ? "Evidence-linked" : "No evidence linked"}
+                              >
+                                {label} {t.text}
+                              </span>
+                            );
+                          })}
                       </div>
                     </div>
 
@@ -1670,7 +1845,7 @@ export default function PatientPage() {
                   </label>
 
                   <label className="block">
-                    <span className="text-xs font-semibold text-slate-700">Sleep hours: {form.sleepHours.toFixed(1)}</span>
+                    <span className="text-xs font-semibold text-slate-700">Sleep hours</span>
                     <input
                       type="number"
                       min={0}
@@ -1678,8 +1853,10 @@ export default function PatientPage() {
                       step={0.1}
                       value={form.sleepHours}
                       onChange={(e) => setForm((f) => ({ ...f, sleepHours: Number(e.target.value) }))}
+                      onBlur={() => setForm((f) => ({ ...f, sleepHours: clamp(Number(f.sleepHours), 0, 24) }))}
                       className="mt-1 w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 shadow-sm"
                     />
+                    <div className="mt-1 text-[11px] text-slate-500">Current: {form.sleepHours.toFixed(1)}h</div>
                   </label>
 
                   <label className="block">
@@ -1719,6 +1896,13 @@ export default function PatientPage() {
                     <input
                       value={tagInput}
                       onChange={(e) => setTagInput(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === ",") {
+                          e.preventDefault();
+                          addTag(tagInput);
+                          setTagInput("");
+                        }
+                      }}
                       placeholder="dairy, stress, spicy…"
                       className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 shadow-sm"
                     />
