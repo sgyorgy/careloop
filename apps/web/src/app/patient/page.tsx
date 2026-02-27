@@ -32,12 +32,37 @@ type TrendPoint = {
   moodScore: number;
 };
 
+type EvidenceRef = {
+  entryDate?: string; // YYYY-MM-DD
+  entryIndex?: number;
+  snippet?: string;
+  tag?: string;
+  score?: number;
+};
+
+type SummaryItem = {
+  text: string;
+  verified: boolean | null; // null = unknown
+  evidence: EvidenceRef[];
+};
+
 type DiarySummary = {
   headline: string;
-  bullets: string[];
-  possibleTriggers: string[];
-  gentleSuggestions: string[];
+  bullets: SummaryItem[];
+  possibleTriggers: SummaryItem[];
+  gentleSuggestions: SummaryItem[];
+  questionsForVisit?: string[];
+  redFlags?: string[];
   last7DaysAvgSymptom: number | null;
+};
+
+type TrustReport = {
+  scorePct: number; // 0-100
+  verifiedCount: number;
+  unverifiedCount: number;
+  totalItems: number;
+  piiDetected: boolean;
+  notes: string[];
 };
 
 type TaskItem = {
@@ -50,9 +75,9 @@ type TaskItem = {
 // ---------------- storage keys ----------------
 const LS_KEYS = {
   diary: "careloop.demoDiary.v1",
-  tasks: "careloop.planTasks.v1", // currently string[]
+  tasks: "careloop.planTasks.v1", // string[]
   tasksState: "careloop.planTasksState.v1", // { [taskId]: { done, updatedAt } }
-  preVisitSummary: "careloop.preVisitSummary.v1",
+  preVisitSummary: "careloop.preVisitSummary.v2", // { summary, trust, generatedAt }
   transcript: "careloop.demoTranscript.v1", // reuse for demo "send to clinician"
 } as const;
 
@@ -77,14 +102,45 @@ const TrendResponseSchema = z.object({
   ),
 });
 
+const EvidenceRefSchema = z.object({
+  entryDate: z.string().optional(),
+  entryIndex: z.number().int().nonnegative().optional(),
+  snippet: z.string().optional(),
+  tag: z.string().optional(),
+  score: z.number().optional(),
+});
+
+const SummaryItemSchema = z.union([
+  z.string(),
+  z.object({
+    text: z.string().min(1),
+    verified: z.boolean().optional(),
+    evidence: z.array(EvidenceRefSchema).optional(),
+  }),
+]);
+
 const SummaryResponseSchema = z.object({
   summary: z.object({
     headline: z.string(),
-    bullets: z.array(z.string()),
-    possibleTriggers: z.array(z.string()),
-    gentleSuggestions: z.array(z.string()),
+    bullets: z.array(SummaryItemSchema),
+    possibleTriggers: z.array(SummaryItemSchema),
+    gentleSuggestions: z.array(SummaryItemSchema),
+    questionsForVisit: z.array(z.string()).optional(),
+    redFlags: z.array(z.string()).optional(),
     last7DaysAvgSymptom: z.number().nullable(),
   }),
+  trust: z
+    .object({
+      scorePct: z.number().min(0).max(100).optional(),
+      verifiedCount: z.number().int().nonnegative().optional(),
+      unverifiedCount: z.number().int().nonnegative().optional(),
+      totalItems: z.number().int().nonnegative().optional(),
+      piiDetected: z.boolean().optional(),
+      notes: z.array(z.string()).optional(),
+    })
+    .optional(),
+  piiDetected: z.boolean().optional(),
+  redacted: z.boolean().optional(),
 });
 
 const RedactResponseSchema = z.object({
@@ -199,6 +255,8 @@ function localRedact(text: string): string {
   return t;
 }
 
+type ApiError = Error & { status?: number; payload?: any };
+
 async function apiPost<T>(path: string, body: unknown): Promise<T> {
   const res = await fetch(`/api${path}`, {
     method: "POST",
@@ -211,7 +269,7 @@ async function apiPost<T>(path: string, body: unknown): Promise<T> {
 
   if (!res.ok) {
     const msg = json?.error ? String(json.error) : `API ${path} failed: ${res.status}`;
-    const err = new Error(msg) as Error & { status?: number; payload?: any };
+    const err = new Error(msg) as ApiError;
     err.status = res.status;
     err.payload = json;
     throw err;
@@ -227,7 +285,7 @@ async function apiPostForm<T>(path: string, form: FormData): Promise<T> {
 
   if (!res.ok) {
     const msg = json?.error ? String(json.error) : `API ${path} failed: ${res.status}`;
-    const err = new Error(msg) as Error & { status?: number; payload?: any };
+    const err = new Error(msg) as ApiError;
     err.status = res.status;
     err.payload = json;
     throw err;
@@ -288,7 +346,8 @@ function computeInsights(diary: DiaryEntry[]) {
   );
 
   const redFlag =
-    (worst?.symptomScore ?? 0) >= 9 || (avg7Sym != null && avg14Sym != null && avg7Sym - avg14Sym >= 2);
+    (worst?.symptomScore ?? 0) >= 9 ||
+    (avg7Sym != null && avg14Sym != null && avg7Sym - avg14Sym >= 2);
 
   return {
     avg7Sym,
@@ -301,6 +360,115 @@ function computeInsights(diary: DiaryEntry[]) {
 }
 
 type RedactionMode = "local" | "api" | "none";
+
+function normalizeSummaryItem(x: unknown): SummaryItem {
+  if (typeof x === "string") return { text: x, verified: null, evidence: [] };
+
+  const o = x as any;
+  const text = typeof o?.text === "string" ? o.text : "";
+  const verified = typeof o?.verified === "boolean" ? o.verified : null;
+  const evidence = Array.isArray(o?.evidence)
+    ? o.evidence
+        .map((e: any) => ({
+          entryDate: typeof e?.entryDate === "string" ? e.entryDate.slice(0, 10) : undefined,
+          entryIndex: typeof e?.entryIndex === "number" ? e.entryIndex : undefined,
+          snippet: typeof e?.snippet === "string" ? e.snippet.slice(0, 240) : undefined,
+          tag: typeof e?.tag === "string" ? e.tag.slice(0, 40) : undefined,
+          score: typeof e?.score === "number" ? e.score : undefined,
+        }))
+        .filter((e: EvidenceRef) => !!(e.entryDate || e.entryIndex != null || e.tag || e.snippet))
+    : [];
+
+  return { text: text || "(missing text)", verified, evidence };
+}
+
+function normalizeSummaryFromApi(parsed: z.infer<typeof SummaryResponseSchema>): {
+  summary: DiarySummary;
+  trust: TrustReport;
+  meta: { redacted: boolean; piiDetected: boolean; generatedAt: number };
+} {
+  const raw = parsed.summary;
+
+  const bullets = (raw.bullets ?? []).map(normalizeSummaryItem).filter((i) => i.text.trim());
+  const triggers = (raw.possibleTriggers ?? []).map(normalizeSummaryItem).filter((i) => i.text.trim());
+  const suggestions = (raw.gentleSuggestions ?? []).map(normalizeSummaryItem).filter((i) => i.text.trim());
+
+  const summary: DiarySummary = {
+    headline: raw.headline,
+    bullets,
+    possibleTriggers: triggers,
+    gentleSuggestions: suggestions,
+    questionsForVisit: raw.questionsForVisit?.slice(0, 8),
+    redFlags: raw.redFlags?.slice(0, 6),
+    last7DaysAvgSymptom: raw.last7DaysAvgSymptom,
+  };
+
+  const computed = computeTrust(summary);
+  const trust: TrustReport = {
+    scorePct: Math.round(parsed.trust?.scorePct ?? computed.scorePct),
+    verifiedCount: parsed.trust?.verifiedCount ?? computed.verifiedCount,
+    unverifiedCount: parsed.trust?.unverifiedCount ?? computed.unverifiedCount,
+    totalItems: parsed.trust?.totalItems ?? computed.totalItems,
+    piiDetected: Boolean(parsed.piiDetected ?? parsed.trust?.piiDetected ?? computed.piiDetected),
+    notes: (parsed.trust?.notes?.length ? parsed.trust.notes : computed.notes).slice(0, 6),
+  };
+
+  const meta = {
+    redacted: Boolean(parsed.redacted),
+    piiDetected: Boolean(parsed.piiDetected),
+    generatedAt: Date.now(),
+  };
+
+  return { summary, trust, meta };
+}
+
+function computeTrust(summary: DiarySummary): TrustReport {
+  const items = [
+    ...(summary.bullets ?? []),
+    ...(summary.possibleTriggers ?? []),
+    ...(summary.gentleSuggestions ?? []),
+  ];
+
+  const totalItems = items.length;
+
+  // Heuristic: "verified" if (a) verified===true OR (b) evidence exists and verified!==false
+  const verifiedCount = items.filter((i) => (i.verified === true ? true : i.verified === false ? false : i.evidence.length > 0))
+    .length;
+
+  const unverifiedCount = Math.max(0, totalItems - verifiedCount);
+
+  const scorePct = totalItems ? Math.round((verifiedCount / totalItems) * 100) : 0;
+
+  const notes: string[] = [];
+  if (!totalItems) notes.push("No items to score yet.");
+  else if (verifiedCount === 0) notes.push("No evidence links provided (yet). Add evidence-backed summary for higher trust.");
+  else if (verifiedCount < totalItems) notes.push("Some items lack evidence links. Treat as hints only.");
+
+  return {
+    scorePct,
+    verifiedCount,
+    unverifiedCount,
+    totalItems,
+    piiDetected: false,
+    notes,
+  };
+}
+
+function formatEvidence(e: EvidenceRef) {
+  const bits: string[] = [];
+  if (e.entryDate) bits.push(e.entryDate);
+  if (e.entryIndex != null) bits.push(`#${e.entryIndex + 1}`);
+  if (e.tag) bits.push(`tag:${e.tag}`);
+  return bits.join(" • ");
+}
+
+function summaryToStoragePayload(summary: DiarySummary, trust: TrustReport) {
+  return {
+    summary,
+    trust,
+    generatedAt: Date.now(),
+  };
+}
 
 // best-effort: redact only notes; numbers/tags are safe-ish synthetic fields
 async function prepareDiaryForApi(diary: DiaryEntry[], mode: RedactionMode) {
@@ -324,18 +492,19 @@ async function prepareDiaryForApi(diary: DiaryEntry[], mode: RedactionMode) {
       redactedNotes.push(note);
       continue;
     }
-    // avoid sending huge notes
     const payloadText = note.slice(0, 20000);
-    const resp = await apiPost<{ redacted: string; piiDetected?: boolean }>("/privacy/redact", { text: payloadText });
+    const resp = await apiPost<{ redacted: string; piiDetected?: boolean }>("/privacy/redact", {
+      text: payloadText,
+    });
     const parsed = RedactResponseSchema.safeParse(resp);
     const redacted = parsed.success ? parsed.data.redacted : localRedact(payloadText);
     piiDetectedAny = piiDetectedAny || Boolean(parsed.success && parsed.data.piiDetected);
     redactedNotes.push(redacted);
   }
 
-  const merged = diary.slice(0, Math.max(0, diary.length - limited.length)).concat(
-    limited.map((e, i) => ({ ...e, notes: redactedNotes[i] ?? "" }))
-  );
+  const merged = diary
+    .slice(0, Math.max(0, diary.length - limited.length))
+    .concat(limited.map((e, i) => ({ ...e, notes: redactedNotes[i] ?? "" })));
 
   return { diary: merged, piiDetected: piiDetectedAny };
 }
@@ -349,8 +518,15 @@ export default function PatientPage() {
   const [diary, setDiary] = useState<DiaryEntry[]>([]);
   const [trend, setTrend] = useState<TrendPoint[]>([]);
   const [summary, setSummary] = useState<DiarySummary | null>(null);
+  const [trust, setTrust] = useState<TrustReport | null>(null);
+  const [summaryGeneratedAt, setSummaryGeneratedAt] = useState<number | null>(null);
 
-  const [busy, setBusy] = useState<{ trends: boolean; summary: boolean; transcribe: boolean; redact: boolean }>({
+  const [busy, setBusy] = useState<{
+    trends: boolean;
+    summary: boolean;
+    transcribe: boolean;
+    redact: boolean;
+  }>({
     trends: false,
     summary: false,
     transcribe: false,
@@ -362,6 +538,11 @@ export default function PatientPage() {
 
   const [redactionMode, setRedactionMode] = useState<RedactionMode>("local");
   const [windowDays, setWindowDays] = useState<7 | 30>(7);
+
+  // Safety controls for API (backend can ignore; UI stays compatible)
+  const [enforcePhiGate, setEnforcePhiGate] = useState<boolean>(true); // block if PII detected
+  const [redactOutput, setRedactOutput] = useState<boolean>(true); // allow API to auto-redact output + flag
+  const [expandedEvidence, setExpandedEvidence] = useState<Record<string, boolean>>({});
 
   // Voice diary (optional)
   const [audioFile, setAudioFile] = useState<File | null>(null);
@@ -378,6 +559,9 @@ export default function PatientPage() {
   });
   const [tagInput, setTagInput] = useState("");
 
+  // Tasks refresh token (fix: useMemo needs a changing dep to re-read localStorage)
+  const [tasksRefreshToken, setTasksRefreshToken] = useState(0);
+
   // Tasks + adherence state
   const tasksRaw = useMemo(() => {
     try {
@@ -387,7 +571,7 @@ export default function PatientPage() {
     } catch {
       return [];
     }
-  }, [tab]);
+  }, [tab, tasksRefreshToken]);
 
   const tasksStateRaw = useMemo(() => {
     try {
@@ -397,7 +581,7 @@ export default function PatientPage() {
     } catch {
       return {};
     }
-  }, [tab]);
+  }, [tab, tasksRefreshToken]);
 
   const tasks: TaskItem[] = useMemo(() => {
     return tasksRaw.slice(0, 50).map((t) => {
@@ -432,6 +616,21 @@ export default function PatientPage() {
         }
       } else if (demo) {
         // Home page loads demo; do nothing here
+      }
+    } catch {
+      // ignore
+    }
+
+    // Load last summary (v2)
+    try {
+      const raw = localStorage.getItem(LS_KEYS.preVisitSummary);
+      if (raw) {
+        const parsed = safeJsonParse<any>(raw);
+        if (parsed?.summary?.headline) {
+          setSummary(parsed.summary as DiarySummary);
+          if (parsed?.trust) setTrust(parsed.trust as TrustReport);
+          if (typeof parsed?.generatedAt === "number") setSummaryGeneratedAt(parsed.generatedAt);
+        }
       }
     } catch {
       // ignore
@@ -504,6 +703,8 @@ export default function PatientPage() {
     setErr(null);
     setNotes([]);
     setSummary(null);
+    setTrust(null);
+    setSummaryGeneratedAt(null);
     persistDiary([]);
     try {
       localStorage.removeItem(LS_KEYS.diary);
@@ -516,6 +717,8 @@ export default function PatientPage() {
     setErr(null);
     setNotes([]);
     setSummary(null);
+    setTrust(null);
+    setSummaryGeneratedAt(null);
     setDiary([]);
     setTrend([]);
     try {
@@ -528,6 +731,7 @@ export default function PatientPage() {
     } catch {
       // ignore
     }
+    setTasksRefreshToken((x) => x + 1);
   }
 
   async function refreshTrends() {
@@ -552,6 +756,14 @@ export default function PatientPage() {
     }
   }
 
+  function explainPiiGateFailure() {
+    setNotes((n) => [
+      ...n,
+      "Safety gate blocked generation: possible PII/PHI detected.",
+      "Tip: switch Redaction to Local/API, then retry. Keep content synthetic in demos.",
+    ]);
+  }
+
   async function generateSummary() {
     setErr(null);
     setNotes([]);
@@ -561,56 +773,129 @@ export default function PatientPage() {
       const { diary: payloadDiary, piiDetected } = await prepareDiaryForApi(diary, redactionMode);
       if (piiDetected) setNotes((n) => [...n, "PII detected and redacted (best-effort) before processing."]);
 
-      const resp = await apiPost<unknown>("/diary/summarize", { diary: payloadDiary });
-      const parsed = SummaryResponseSchema.safeParse(resp);
+      const resp = await apiPost<unknown>("/diary/summarize", {
+        diary: payloadDiary,
+        // backend can ignore these (forward compatible)
+        enforceRedaction: enforcePhiGate,
+        redactOutput: redactOutput,
+        windowDays,
+      });
 
-      if (parsed.success) {
-        setSummary(parsed.data.summary);
+      const parsed = SummaryResponseSchema.safeParse(resp);
+      if (!parsed.success) throw new Error("Bad summary response");
+
+      const normalized = normalizeSummaryFromApi(parsed.data);
+
+      setSummary(normalized.summary);
+      setTrust(normalized.trust);
+      setSummaryGeneratedAt(normalized.meta.generatedAt);
+
+      if (normalized.meta.piiDetected) {
+        setNotes((n) => [
+          ...n,
+          normalized.meta.redacted
+            ? "PII detected in model output and redacted (best-effort)."
+            : "PII detected in model output.",
+        ]);
+      }
+
+      try {
+        localStorage.setItem(
+          LS_KEYS.preVisitSummary,
+          JSON.stringify(summaryToStoragePayload(normalized.summary, normalized.trust))
+        );
+      } catch {
+        // ignore
+      }
+      return;
+    } catch (e) {
+      const errObj = e as ApiError;
+      const code = errObj?.payload?.code ? String(errObj.payload.code) : "";
+      if (code === "PII_DETECTED") {
+        explainPiiGateFailure();
+      } else {
+        // fall back to local heuristic summary
+        const last7 = lastNDays(diary, 7);
+        const avgSym = avg(last7.map((x) => x.symptomScore));
+        const worst = last7.reduce(
+          (acc, x) => (!acc || x.symptomScore > acc.symptomScore ? x : acc),
+          null as DiaryEntry | null
+        );
+
+        const tagStats = extractTagStats(last7);
+        const triggers = Array.from(tagStats.entries())
+          .filter(([, v]) => v.count >= 2)
+          .sort((a, b) => b[1].avgSymptom - a[1].avgSymptom)
+          .slice(0, 3)
+          .map(([k]) => k);
+
+        const localSummary: DiarySummary = {
+          headline: diary.length
+            ? "Pre-visit summary (local fallback)"
+            : "Add a few diary entries to generate a summary",
+          bullets: diary.length
+            ? [
+                {
+                  text:
+                    avgSym != null
+                      ? `Last 7 days avg symptom score: ${avgSym.toFixed(1)} / 10`
+                      : "Not enough data for a 7-day average",
+                  verified: null,
+                  evidence: [],
+                },
+                {
+                  text: worst
+                    ? `Worst day (last 7 days): ${worst.date} (symptom ${worst.symptomScore}/10)`
+                    : "No worst day available",
+                  verified: null,
+                  evidence: [],
+                },
+                { text: "Patterns are hints only (not a diagnosis).", verified: null, evidence: [] },
+              ]
+            : [],
+          possibleTriggers: triggers.map((t) => ({ text: t, verified: null, evidence: [] })),
+          gentleSuggestions: diary.length
+            ? [
+                {
+                  text: "Keep logging meals/sleep alongside symptoms for clearer patterns.",
+                  verified: null,
+                  evidence: [],
+                },
+                {
+                  text: "If symptoms worsen or new red flags appear, consider contacting a clinician.",
+                  verified: null,
+                  evidence: [],
+                },
+              ]
+            : [],
+          questionsForVisit: diary.length
+            ? [
+                "When did symptoms start, and what seems to worsen/improve them?",
+                "Any recent diet/med changes, stress, travel, or illness exposures?",
+                "Any new red flags (fever, severe pain, dehydration, blood)?",
+              ]
+            : [],
+          redFlags: [],
+          last7DaysAvgSymptom: avgSym,
+        };
+
+        const localTrust = computeTrust(localSummary);
+
+        setSummary(localSummary);
+        setTrust(localTrust);
+        setSummaryGeneratedAt(Date.now());
+
         try {
-          localStorage.setItem(LS_KEYS.preVisitSummary, JSON.stringify(parsed.data.summary));
+          localStorage.setItem(
+            LS_KEYS.preVisitSummary,
+            JSON.stringify(summaryToStoragePayload(localSummary, localTrust))
+          );
         } catch {
           // ignore
         }
-        return;
+
+        setNotes((n) => [...n, "API unavailable — summary generated locally (demo fallback)."]);
       }
-
-      throw new Error("No summary from API.");
-    } catch {
-      // Local fallback (simple heuristics)
-      const last7 = lastNDays(diary, 7);
-      const avgSym = avg(last7.map((e) => e.symptomScore));
-      const worst = last7.reduce(
-        (acc, e) => (!acc || e.symptomScore > acc.symptomScore ? e : acc),
-        null as DiaryEntry | null
-      );
-
-      const tagStats = extractTagStats(last7);
-      const triggers = Array.from(tagStats.entries())
-        .filter(([, v]) => v.count >= 2)
-        .sort((a, b) => b[1].avgSymptom - a[1].avgSymptom)
-        .slice(0, 3)
-        .map(([k]) => k);
-
-      setSummary({
-        headline: diary.length ? "Pre-visit summary (quick, local)" : "Add a few diary entries to generate a summary",
-        bullets: diary.length
-          ? [
-              avgSym != null ? `Last 7 days avg symptom score: ${avgSym.toFixed(1)} / 10` : "Not enough data for a 7-day average",
-              worst ? `Worst day (last 7 days): ${worst.date} (symptom ${worst.symptomScore}/10)` : "No worst day available",
-              "Patterns are hints only (not a diagnosis).",
-            ]
-          : [],
-        possibleTriggers: triggers,
-        gentleSuggestions: diary.length
-          ? [
-              "Keep logging meals/sleep alongside symptoms for clearer patterns.",
-              "If symptoms worsen or new red flags appear, consider contacting a clinician.",
-            ]
-          : [],
-        last7DaysAvgSymptom: avgSym,
-      });
-
-      setNotes((n) => [...n, "API unavailable — summary generated locally (demo fallback)."]);
     } finally {
       setBusy((b) => ({ ...b, summary: false }));
     }
@@ -662,18 +947,14 @@ export default function PatientPage() {
       const current = next[taskId]?.done ?? false;
       next[taskId] = { done: !current, updatedAt: Date.now() };
       localStorage.setItem(LS_KEYS.tasksState, JSON.stringify(next));
-      // force re-render by touching state via searchParams dependency is not enough; simplest: update notes
-      setNotes((n) => (n.length ? [...n] : []));
+      setTasksRefreshToken((x) => x + 1);
     } catch {
       setErr("Could not save task state (browser policy/private mode).");
     }
   }
 
   const canAnalyze = diary.length >= 2;
-  const windowedDiary = useMemo(() => {
-    const d = lastNDays(diary, windowDays);
-    return d;
-  }, [diary, windowDays]);
+  const windowedDiary = useMemo(() => lastNDays(diary, windowDays), [diary, windowDays]);
 
   const windowedTrend = useMemo(() => {
     const set = new Set(windowedDiary.map((e) => e.date));
@@ -686,21 +967,37 @@ export default function PatientPage() {
     const lines: string[] = [];
     lines.push("PATIENT PRE-VISIT SUMMARY (synthetic / demo)");
     lines.push(`Window: last ${windowDays} days`);
+    if (trust) lines.push(`Trust score (evidence coverage): ${trust.scorePct}% (${trust.verifiedCount}/${trust.totalItems})`);
     if (insights.avg7Sym != null) lines.push(`Avg symptom (7d): ${insights.avg7Sym.toFixed(1)}/10`);
     if (insights.avg7Sleep != null) lines.push(`Avg sleep (7d): ${insights.avg7Sleep.toFixed(1)}h`);
     if (insights.avg7Mood != null) lines.push(`Avg mood (7d): ${insights.avg7Mood.toFixed(1)}/10`);
     lines.push(`Trend: ${insights.direction}`);
     if (insights.worst) lines.push(`Worst day (7d): ${insights.worst.date} • symptom ${insights.worst.symptomScore}/10`);
 
+    if (summary?.redFlags?.length) {
+      lines.push("");
+      lines.push("Red flags (screening prompts, not diagnosis):");
+      for (const r of summary.redFlags.slice(0, 6)) lines.push(`- ${r}`);
+    }
+
     if (summary?.bullets?.length) {
       lines.push("");
       lines.push("Highlights:");
-      for (const b of summary.bullets.slice(0, 8)) lines.push(`- ${b}`);
+      for (const b of summary.bullets.slice(0, 10)) lines.push(`- ${b.text}`);
     }
 
     if (summary?.possibleTriggers?.length) {
+      const trig = summary.possibleTriggers.map((t) => t.text).filter(Boolean).slice(0, 8);
+      if (trig.length) {
+        lines.push("");
+        lines.push(`Possible triggers: ${trig.join(", ")}`);
+      }
+    }
+
+    if (summary?.questionsForVisit?.length) {
       lines.push("");
-      lines.push(`Possible triggers: ${summary.possibleTriggers.slice(0, 6).join(", ")}`);
+      lines.push("Questions to discuss at visit:");
+      for (const q of summary.questionsForVisit.slice(0, 8)) lines.push(`- ${q}`);
     }
 
     if (adherence) {
@@ -714,7 +1011,7 @@ export default function PatientPage() {
     }
 
     return lines.join("\n");
-  }, [summary, insights, adherence, tasks, windowDays]);
+  }, [summary, insights, adherence, tasks, windowDays, trust]);
 
   async function copyToClipboard(text: string) {
     try {
@@ -734,6 +1031,21 @@ export default function PatientPage() {
     }
   }
 
+  function toggleEvidence(key: string) {
+    setExpandedEvidence((m) => ({ ...m, [key]: !m[key] }));
+  }
+
+  function trustBadge() {
+    if (!trust) return null;
+    const label =
+      trust.scorePct >= 75 ? "High confidence" : trust.scorePct >= 40 ? "Mixed confidence" : "Low confidence";
+    return (
+      <span className="rounded-full border border-slate-200 bg-white px-3 py-1 text-xs text-slate-700 shadow-sm">
+        {label} • {trust.scorePct}%
+      </span>
+    );
+  }
+
   return (
     <main className="min-h-screen bg-gradient-to-b from-white to-slate-50">
       <div className="mx-auto max-w-6xl px-6 py-8">
@@ -744,9 +1056,11 @@ export default function PatientPage() {
               <span className="rounded-full border border-slate-200 bg-white px-3 py-1 text-xs text-slate-700 shadow-sm">
                 Closed-loop • Synthetic-first
               </span>
+              {tab === "diary" ? trustBadge() : null}
             </div>
             <p className="mt-2 max-w-2xl text-sm text-slate-700">
-              Log symptoms/sleep/mood and generate trends + a pre-visit summary. Tasks come from the clinician SOAP Plan.
+              Log symptoms/sleep/mood and generate trends + an evidence-backed pre-visit summary. Tasks come from the
+              clinician SOAP Plan.
             </p>
           </div>
 
@@ -805,6 +1119,29 @@ export default function PatientPage() {
             </select>
           </div>
 
+          {tab === "diary" ? (
+            <div className="flex flex-wrap items-center gap-3">
+              <label className="flex items-center gap-2 text-sm text-slate-700">
+                <input
+                  type="checkbox"
+                  checked={enforcePhiGate}
+                  onChange={(e) => setEnforcePhiGate(e.target.checked)}
+                  className="h-4 w-4 rounded border-slate-300"
+                />
+                Block if PII detected
+              </label>
+              <label className="flex items-center gap-2 text-sm text-slate-700">
+                <input
+                  type="checkbox"
+                  checked={redactOutput}
+                  onChange={(e) => setRedactOutput(e.target.checked)}
+                  className="h-4 w-4 rounded border-slate-300"
+                />
+                Redact model output (best-effort)
+              </label>
+            </div>
+          ) : null}
+
           <div className="ml-auto flex flex-wrap gap-2">
             <button
               onClick={() => downloadJson("diary.json", diary)}
@@ -821,7 +1158,7 @@ export default function PatientPage() {
             <button
               onClick={clearAllDemoData}
               className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-800"
-              title="Clears diary + tasks + adherence (demo reset)"
+              title="Clears diary + tasks + adherence + cached summary (demo reset)"
             >
               Clear ALL demo data
             </button>
@@ -927,7 +1264,7 @@ export default function PatientPage() {
             <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
               <h3 className="text-base font-semibold text-slate-900">Safety</h3>
               <p className="mt-2 text-sm text-slate-700">
-                This is a prototype. Tasks and suggestions are informational only and not medical advice.
+                Prototype only. Tasks and suggestions are informational and not medical advice.
               </p>
               <div className="mt-4 rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-xs text-slate-600">
                 Tip: keep everything synthetic for demos; never store PHI in this repo or logs.
@@ -1042,10 +1379,28 @@ export default function PatientPage() {
               </div>
 
               <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
-                <h2 className="text-lg font-semibold text-slate-900">Pre-visit summary</h2>
-                <p className="mt-2 text-sm text-slate-700">
-                  A short, clinician-friendly summary (patterns only, not diagnosis).
-                </p>
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <h2 className="text-lg font-semibold text-slate-900">Pre-visit summary</h2>
+                    <p className="mt-2 text-sm text-slate-700">
+                      Clinician-friendly, with optional evidence links (patterns only, not diagnosis).
+                    </p>
+                  </div>
+                  {trust ? (
+                    <div className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-900">
+                      <div className="text-xs font-semibold text-slate-700">Trust score</div>
+                      <div className="mt-1">
+                        <span className="text-lg font-semibold">{trust.scorePct}%</span>{" "}
+                        <span className="text-xs text-slate-600">
+                          ({trust.verifiedCount}/{trust.totalItems})
+                        </span>
+                      </div>
+                      {trust.piiDetected ? (
+                        <div className="mt-1 text-[11px] text-amber-700">PII flagged</div>
+                      ) : null}
+                    </div>
+                  ) : null}
+                </div>
 
                 {summary ? (
                   <div className="mt-4 space-y-3">
@@ -1056,15 +1411,100 @@ export default function PatientPage() {
                           Last 7 days avg symptom: {summary.last7DaysAvgSymptom.toFixed(1)}/10
                         </div>
                       )}
+                      {summaryGeneratedAt ? (
+                        <div className="mt-1 text-[11px] text-slate-500">
+                          Generated: {new Date(summaryGeneratedAt).toLocaleString()}
+                        </div>
+                      ) : null}
                     </div>
+
+                    {trust?.notes?.length ? (
+                      <div className="rounded-xl border border-slate-200 bg-white px-4 py-3">
+                        <div className="text-xs font-semibold text-slate-700">Quality & safety</div>
+                        <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-slate-800">
+                          {trust.notes.map((t, i) => (
+                            <li key={`${t}-${i}`}>{t}</li>
+                          ))}
+                        </ul>
+                        <div className="mt-2 text-[11px] text-slate-500">
+                          Evidence coverage is a prototype metric — it’s not clinical validation.
+                        </div>
+                      </div>
+                    ) : null}
+
+                    {!!summary.redFlags?.length ? (
+                      <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3">
+                        <div className="text-xs font-semibold text-amber-900">Red flags (screening prompts)</div>
+                        <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-amber-900">
+                          {summary.redFlags.map((r, i) => (
+                            <li key={`${r}-${i}`}>{r}</li>
+                          ))}
+                        </ul>
+                      </div>
+                    ) : null}
 
                     {!!summary.bullets?.length && (
                       <div className="rounded-xl border border-slate-200 bg-white px-4 py-3">
                         <div className="text-xs font-semibold text-slate-700">Highlights</div>
-                        <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-slate-800">
-                          {summary.bullets.map((b, i) => (
-                            <li key={`${b}-${i}`}>{b}</li>
-                          ))}
+                        <ul className="mt-2 space-y-2">
+                          {summary.bullets.slice(0, 10).map((b, i) => {
+                            const key = `b_${i}_${stableId(b.text)}`;
+                            const hasEvidence = (b.evidence?.length ?? 0) > 0;
+                            const status =
+                              b.verified === true || (b.verified == null && hasEvidence)
+                                ? "Verified"
+                                : b.verified === false
+                                ? "Unverified"
+                                : "No evidence";
+
+                            return (
+                              <li key={key} className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2">
+                                <div className="flex items-start justify-between gap-3">
+                                  <div className="text-sm text-slate-900">{b.text}</div>
+                                  <button
+                                    onClick={() => toggleEvidence(key)}
+                                    className="shrink-0 rounded-lg border border-slate-200 bg-white px-2 py-1 text-[11px] text-slate-700 hover:bg-slate-50"
+                                  >
+                                    {expandedEvidence[key] ? "Hide" : "Evidence"}
+                                  </button>
+                                </div>
+
+                                <div className="mt-1 flex items-center gap-2 text-[11px] text-slate-600">
+                                  <span className="rounded-full border border-slate-200 bg-white px-2 py-0.5">
+                                    {status}
+                                  </span>
+                                  {hasEvidence ? (
+                                    <span className="text-slate-500">{b.evidence.length} link(s)</span>
+                                  ) : (
+                                    <span className="text-slate-500">—</span>
+                                  )}
+                                </div>
+
+                                {expandedEvidence[key] ? (
+                                  <div className="mt-2 rounded-lg border border-slate-200 bg-white px-3 py-2">
+                                    {hasEvidence ? (
+                                      <ul className="space-y-2 text-xs text-slate-700">
+                                        {b.evidence.slice(0, 5).map((e, j) => (
+                                          <li key={`${key}_e_${j}`} className="rounded-md border border-slate-200 bg-slate-50 px-2 py-1">
+                                            <div className="text-[11px] font-semibold text-slate-700">
+                                              {formatEvidence(e) || "Evidence"}
+                                            </div>
+                                            {e.snippet ? (
+                                              <div className="mt-1 text-xs text-slate-700">“{e.snippet}”</div>
+                                            ) : null}
+                                          </li>
+                                        ))}
+                                      </ul>
+                                    ) : (
+                                      <div className="text-xs text-slate-600">
+                                        No evidence returned for this item.
+                                      </div>
+                                    )}
+                                  </div>
+                                ) : null}
+                              </li>
+                            );
+                          })}
                         </ul>
                       </div>
                     )}
@@ -1072,25 +1512,53 @@ export default function PatientPage() {
                     <div className="rounded-xl border border-slate-200 bg-white px-4 py-3">
                       <div className="text-xs font-semibold text-slate-700">Possible triggers</div>
                       <div className="mt-2 flex flex-wrap gap-2">
-                        {(summary.possibleTriggers?.length ? summary.possibleTriggers : ["—"]).map((t, i) => (
-                          <span
-                            key={`${t}-${i}`}
-                            className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs text-slate-700"
-                          >
-                            {t}
-                          </span>
-                        ))}
+                        {(summary.possibleTriggers?.length ? summary.possibleTriggers : [{ text: "—", verified: null, evidence: [] }]).slice(0, 10).map((t, i) => {
+                          const hasEvidence = (t.evidence?.length ?? 0) > 0;
+                          const label =
+                            t.verified === true || (t.verified == null && hasEvidence)
+                              ? "✓"
+                              : t.verified === false
+                              ? "?"
+                              : "•";
+                          return (
+                            <span
+                              key={`tr_${i}_${stableId(t.text)}`}
+                              className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs text-slate-700"
+                              title={hasEvidence ? "Evidence-linked" : "No evidence linked"}
+                            >
+                              {label} {t.text}
+                            </span>
+                          );
+                        })}
                       </div>
                     </div>
 
                     <div className="rounded-xl border border-slate-200 bg-white px-4 py-3">
                       <div className="text-xs font-semibold text-slate-700">Gentle suggestions</div>
                       <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-slate-800">
-                        {(summary.gentleSuggestions?.length ? summary.gentleSuggestions : ["—"]).map((s, i) => (
-                          <li key={`${s}-${i}`}>{s}</li>
-                        ))}
+                        {(summary.gentleSuggestions?.length
+                          ? summary.gentleSuggestions
+                          : [{ text: "—", verified: null, evidence: [] }]
+                        )
+                          .slice(0, 8)
+                          .map((s, i) => (
+                            <li key={`gs_${i}_${stableId(s.text)}`}>
+                              <span className="text-slate-900">{s.text}</span>
+                            </li>
+                          ))}
                       </ul>
                     </div>
+
+                    {!!summary.questionsForVisit?.length ? (
+                      <div className="rounded-xl border border-slate-200 bg-white px-4 py-3">
+                        <div className="text-xs font-semibold text-slate-700">Questions for the visit</div>
+                        <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-slate-800">
+                          {summary.questionsForVisit.slice(0, 8).map((q, i) => (
+                            <li key={`${q}-${i}`}>{q}</li>
+                          ))}
+                        </ul>
+                      </div>
+                    ) : null}
 
                     <div className="flex flex-wrap gap-2">
                       <button
@@ -1121,7 +1589,7 @@ export default function PatientPage() {
                 )}
 
                 <div className="mt-4 rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-xs text-slate-600">
-                  Safety: This prototype is informational and not medical advice.
+                  Safety: informational only, not medical advice. Keep entries synthetic for demos.
                 </div>
               </div>
             </section>
@@ -1140,7 +1608,8 @@ export default function PatientPage() {
                     <div>
                       <div className="text-xs font-semibold text-slate-700">Voice note (optional)</div>
                       <div className="mt-1 text-xs text-slate-600">
-                        Transcribe audio into the entry notes (uses <code className="rounded bg-white px-1">/api/transcribe</code>).
+                        Transcribe audio into the entry notes (uses{" "}
+                        <code className="rounded bg-white px-1">/api/transcribe</code>).
                       </div>
                     </div>
                     <div className="flex flex-wrap gap-2">
@@ -1236,6 +1705,12 @@ export default function PatientPage() {
                     className="mt-1 w-full rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 shadow-sm"
                     rows={4}
                   />
+                  {redactionMode !== "none" && form.notes ? (
+                    <div className="mt-2 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-700">
+                      <div className="text-[11px] font-semibold text-slate-700">Preview (best-effort redaction)</div>
+                      <div className="mt-1">{localRedact(form.notes)}</div>
+                    </div>
+                  ) : null}
                 </label>
 
                 <div className="mt-4">
@@ -1299,7 +1774,9 @@ export default function PatientPage() {
 
               <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
                 <h2 className="text-lg font-semibold text-slate-900">Diary entries</h2>
-                <p className="mt-2 text-sm text-slate-700">{diary.length ? `${diary.length} entries` : "No entries yet."}</p>
+                <p className="mt-2 text-sm text-slate-700">
+                  {diary.length ? `${diary.length} entries` : "No entries yet."}
+                </p>
 
                 {diary.length ? (
                   <div className="mt-4 space-y-2">
@@ -1344,7 +1821,9 @@ export default function PatientPage() {
                           ) : null}
                         </div>
                       ))}
-                    {diary.length > 12 && <div className="text-xs text-slate-500">Showing last 12 entries (newest first).</div>}
+                    {diary.length > 12 && (
+                      <div className="text-xs text-slate-500">Showing last 12 entries (newest first).</div>
+                    )}
                   </div>
                 ) : (
                   <div className="mt-4 rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-700">
