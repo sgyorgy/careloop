@@ -16,11 +16,13 @@ type DiaryEntry = {
 type DemoPayload = {
   diary: DiaryEntry[];
   clinicianTranscript: string;
+  reportText: string;
 };
 
 const DEMO_KEYS = {
   diary: "careloop.demoDiary.v1",
   transcript: "careloop.demoTranscript.v1",
+  reportText: "careloop.demoReportText.v1",
   loadedAt: "careloop.demoLoadedAt.v1",
 } as const;
 
@@ -59,19 +61,45 @@ function makeDemo(): DemoPayload {
     "Plan: trial lactose-free diet for 2 weeks, keep symptom diary, consider OTC lactase as needed, follow up in 2–3 weeks, " +
     "return sooner if worsening pain, fever, or blood in stool.";
 
-  return { diary, clinicianTranscript };
+  // Synthetic “medical report” (no identifiers)
+  // Keep it text-first for hackathon stability; PDF upload can come later.
+  const reportText = [
+    "SYNTHETIC MEDICAL REPORT (DEMO — NO PHI)",
+    "",
+    "LABORATORY RESULTS — 2026-02-20",
+    "HbA1c: 7.8 % (ref: 4.0–5.6)  [H]",
+    "Fasting glucose: 9.2 mmol/L (ref: 3.9–5.5)  [H]",
+    "LDL cholesterol: 3.6 mmol/L (ref: <3.0)  [H]",
+    "HDL cholesterol: 1.0 mmol/L (ref: >1.0)  [L/N borderline]",
+    "Triglycerides: 2.1 mmol/L (ref: <1.7)  [H]",
+    "CRP: 12 mg/L (ref: <5)  [H]",
+    "ALT: 58 U/L (ref: <45)  [H]",
+    "Creatinine: 78 µmol/L (ref: 62–106)  [N]",
+    "",
+    "IMAGING (SUMMARY)",
+    "Abdominal ultrasound: hepatic steatosis (mild). Renal cyst (benignus-appearing), no hydronephrosis.",
+    "",
+    "CLINICAL WORDING / TERMS",
+    "status post dietary change; suspected metabolic syndrome. No acute distress. Rule out secondary causes if persistent.",
+    "",
+    "IMPRESSION",
+    "Findings consistent with elevated glycemic markers and dyslipidemia. Inflammatory marker (CRP) mildly elevated.",
+    "This document is informational only. A clinician should interpret in context.",
+  ].join("\n");
+
+  return { diary, clinicianTranscript, reportText };
 }
 
 export default function HomePage() {
   const router = useRouter();
   const [status, setStatus] = useState<"idle" | "loaded" | "error">("idle");
-
   const demo = useMemo(() => makeDemo(), []);
 
-  function loadDemoAndGo(path: "/patient" | "/clinician") {
+  function loadDemoAndGo(path: "/patient" | "/clinician" | "/report") {
     try {
       localStorage.setItem(DEMO_KEYS.diary, JSON.stringify(demo.diary));
       localStorage.setItem(DEMO_KEYS.transcript, demo.clinicianTranscript);
+      localStorage.setItem(DEMO_KEYS.reportText, demo.reportText);
       localStorage.setItem(DEMO_KEYS.loadedAt, new Date().toISOString());
       setStatus("loaded");
       router.push(`${path}?demo=1`);
@@ -84,6 +112,7 @@ export default function HomePage() {
     try {
       localStorage.removeItem(DEMO_KEYS.diary);
       localStorage.removeItem(DEMO_KEYS.transcript);
+      localStorage.removeItem(DEMO_KEYS.reportText);
       localStorage.removeItem(DEMO_KEYS.loadedAt);
       setStatus("idle");
     } catch {
@@ -100,34 +129,30 @@ export default function HomePage() {
               <span className="inline-block h-2 w-2 rounded-full bg-emerald-500" />
               Hackathon Prototype • No PHI • Synthetic demo
             </div>
-            <h1 className="mt-4 text-4xl font-semibold tracking-tight text-slate-900 sm:text-5xl">
-              CareLoop
-            </h1>
+
+            <h1 className="mt-4 text-4xl font-semibold tracking-tight text-slate-900 sm:text-5xl">CareLoop</h1>
+
             <p className="mt-3 max-w-2xl text-base text-slate-700 sm:text-lg">
-              Patient diary insights + clinician voice-to-SOAP notes — connected in one closed loop so the plan becomes
-              actionable tracking.
+              Diary insights + voice-to-SOAP clinical notes + medical report interpretation — connected in one closed loop
+              so plans become actionable tracking.
             </p>
           </div>
 
           <div className="hidden sm:flex flex-col items-end gap-2">
-            <Link
-              href="/privacy"
-              className="text-sm text-slate-700 underline underline-offset-4 hover:text-slate-900"
-            >
+            <Link href="/privacy" className="text-sm text-slate-700 underline underline-offset-4 hover:text-slate-900">
               Privacy & Safety
             </Link>
             <div className="text-xs text-slate-500">
-              Tip: set <code className="rounded bg-slate-100 px-1">API_PROXY_TARGET</code> to use <code className="rounded bg-slate-100 px-1">/api/*</code>
+              Tip: set <code className="rounded bg-slate-100 px-1">API_PROXY_TARGET</code> to use{" "}
+              <code className="rounded bg-slate-100 px-1">/api/*</code>
             </div>
           </div>
         </header>
 
-        <section className="mt-10 grid gap-6 md:grid-cols-3">
+        <section className="mt-10 grid gap-6 md:grid-cols-2 lg:grid-cols-4">
           <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
             <h2 className="text-lg font-semibold text-slate-900">Patient mode</h2>
-            <p className="mt-2 text-sm text-slate-700">
-              Log symptoms, sleep, mood. See trends + a pre-visit summary in seconds.
-            </p>
+            <p className="mt-2 text-sm text-slate-700">Log symptoms, sleep, mood. See trends + a pre-visit summary.</p>
             <div className="mt-5 flex flex-wrap gap-3">
               <Link
                 href="/patient"
@@ -166,9 +191,30 @@ export default function HomePage() {
           </div>
 
           <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
+            <h2 className="text-lg font-semibold text-slate-900">Report interpreter</h2>
+            <p className="mt-2 text-sm text-slate-700">
+              Paste labs/findings. Tap-to-explain terms + “my values vs normal” table + draft summaries.
+            </p>
+            <div className="mt-5 flex flex-wrap gap-3">
+              <Link
+                href="/report"
+                className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-800"
+              >
+                Open Report
+              </Link>
+              <button
+                onClick={() => loadDemoAndGo("/report")}
+                className="rounded-xl border border-slate-200 bg-white px-4 py-2 text-sm font-medium text-slate-900 hover:bg-slate-50"
+              >
+                Load demo → Report
+              </button>
+            </div>
+          </div>
+
+          <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
             <h2 className="text-lg font-semibold text-slate-900">Closed-loop plan</h2>
             <p className="mt-2 text-sm text-slate-700">
-              Turn the SOAP “Plan” into patient tasks and reminders — the plan becomes trackable.
+              Turn clinician outputs into patient tasks and reminders — the plan becomes trackable.
             </p>
             <div className="mt-5 flex flex-wrap gap-3">
               <Link
@@ -203,11 +249,19 @@ export default function HomePage() {
               >
                 Clear demo data
               </button>
+
               <Link
                 href="/patient?demo=1"
                 className="rounded-xl border border-slate-200 bg-white px-4 py-2 text-sm font-medium text-slate-900 hover:bg-slate-50"
               >
-                Continue demo
+                Continue demo (Patient)
+              </Link>
+
+              <Link
+                href="/report?demo=1"
+                className="rounded-xl border border-slate-200 bg-white px-4 py-2 text-sm font-medium text-slate-900 hover:bg-slate-50"
+              >
+                Continue demo (Report)
               </Link>
             </div>
           </div>
@@ -215,13 +269,12 @@ export default function HomePage() {
           {status !== "idle" && (
             <div className="mt-4 rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-800">
               {status === "loaded" && (
-                <span>
-                  ✅ Demo data loaded into localStorage. Open Patient/Clinician pages to see it.
-                </span>
+                <span>✅ Demo data loaded into localStorage. Open Patient/Clinician/Report pages to see it.</span>
               )}
               {status === "error" && (
                 <span>
-                  ⚠️ Couldn’t access localStorage (private mode / policy). You can still use the app without demo loading.
+                  ⚠️ Couldn’t access localStorage (private mode / policy). You can still use the app without demo
+                  loading.
                 </span>
               )}
             </div>
@@ -234,7 +287,7 @@ export default function HomePage() {
             <code className="rounded bg-slate-100 px-1">API_PROXY_TARGET</code>).
           </div>
           <div>
-            <span className="text-slate-400">CareLoop</span> • demo-first • schema-validated outputs
+            <span className="text-slate-400">CareLoop</span> • demo-first • schema-validated outputs • informational only
           </div>
         </footer>
       </div>
