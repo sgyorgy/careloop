@@ -1183,7 +1183,7 @@ const TYPICAL_LAB_RANGES: Record<string, RangeInfo> = {
   ldl: { low: null, high: 100, unit: "mg/dL", note: "Targets depend on cardiovascular risk; clinician-guided." },
   hdl: { low: 40, high: null, unit: "mg/dL", note: "Higher is generally better; ranges vary by sex and lab." },
   triglycerides: { low: null, high: 150, unit: "mg/dL", note: "Fasting status affects results." },
-  total cholesterol: { low: null, high: 200, unit: "mg/dL", note: "Interpretation depends on overall risk profile." },
+  total: { low: null, high: 200, unit: "mg/dL", note: "Interpretation depends on overall risk profile." },
 
   // Inflammation
   crp: { low: 0, high: 10, unit: "mg/L", note: "Many labs use different cutoffs; clinical context matters." },
