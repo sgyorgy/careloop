@@ -1285,7 +1285,8 @@ function PatientPageContent() {
     }
   }, []);
 
-  const canAnalyze = diary.length >= 2;
+  const canTrend = diary.length >= 2;
+  const canSummarize = diary.length >= 1; // ha 1 bejegyzésből is engednéd
 
   const windowedDiary = useMemo(() => lastNDays(diary, windowDays), [diary, windowDays]);
 
@@ -1655,7 +1656,7 @@ function PatientPageContent() {
 
                  <div className="flex flex-wrap gap-2">
                     <button
-                      disabled={!canAnalyze || busy.trends}
+                      disabled={!canTrend || busy.trends}
                       onClick={refreshTrends}
                       className={`rounded-xl px-4 py-2 text-sm font-medium ${
                         !canAnalyze || busy.trends
@@ -1667,7 +1668,7 @@ function PatientPageContent() {
                     </button>
                   
                     <button
-                      disabled={!canAnalyze || busy.summary}
+                      disabled={!canSummarize || busy.summary}
                       onClick={generateSummary}
                       className={`rounded-xl px-4 py-2 text-sm font-medium ${
                         !canAnalyze || busy.summary
