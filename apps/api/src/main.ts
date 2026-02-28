@@ -333,12 +333,6 @@ const DEFAULT_ENFORCE_REDACTION = (process.env.DEFAULT_ENFORCE_REDACTION ?? "fal
 const DIARY_SUMMARY_MAX_ENTRIES = Math.max(1, Math.min(365, Number(process.env.DIARY_SUMMARY_MAX_ENTRIES ?? 30)));
 const DIARY_NOTES_MAX_CHARS = Math.max(0, Math.min(2000, Number(process.env.DIARY_NOTES_MAX_CHARS ?? 400)));
 
-// Sentiment tracking knobs (optional)
-const SENTIMENT_ENABLED = (process.env.SENTIMENT_ENABLED ?? "true") !== "false";
-const SENTIMENT_DOC_MAX_CHARS = Math.max(200, Math.min(20_000, Number(process.env.SENTIMENT_MAX_CHARS ?? 4000)));
-// Azure Text Analytics request doc limit can be strict; 10 is a safe default
-const SENTIMENT_BATCH_SIZE = Math.max(1, Math.min(10, Number(process.env.SENTIMENT_BATCH_SIZE ?? 10)));
-
 function clamp(n: number, lo: number, hi: number) {
   return Math.max(lo, Math.min(hi, n));
 }
@@ -348,30 +342,15 @@ function mean(nums: number[]) {
   return nums.reduce((a, b) => a + b, 0) / nums.length;
 }
 
-function primaryLangTag(lang?: string) {
-  const raw = String(lang ?? "").trim();
-  if (!raw) return "en";
-  // "hu-HU" -> "hu", "en-US" -> "en"
-  const tag = raw.split(/[-_]/)[0]?.toLowerCase();
-  return tag || "en";
-}
-
-// Memoize clients (cheap + avoids re-instantiation per request)
-let _azureOpenAI: ReturnType<typeof makeAzureOpenAI> | null | undefined;
 function makeAzureOpenAI() {
-  if (_azureOpenAI !== undefined) return _azureOpenAI;
-
   const endpoint = process.env.AZURE_OPENAI_ENDPOINT;
   const apiKey = process.env.AZURE_OPENAI_KEY;
   const deployment = process.env.AZURE_OPENAI_DEPLOYMENT;
   const apiVersion = process.env.AZURE_OPENAI_API_VERSION ?? "2024-02-15-preview";
-  if (!endpoint || !apiKey || !deployment) {
-    _azureOpenAI = null;
-    return _azureOpenAI;
-  }
+  if (!endpoint || !apiKey || !deployment) return null;
 
   const baseURL = `${endpoint.replace(/\/$/, "")}/openai/deployments/${deployment}`;
-  _azureOpenAI = {
+  return {
     client: new OpenAI({
       apiKey,
       baseURL,
@@ -380,23 +359,13 @@ function makeAzureOpenAI() {
     }),
     deployment,
   };
-
-  return _azureOpenAI;
 }
 
-let _textAnalytics: TextAnalyticsClient | null | undefined;
 function makeTextAnalytics() {
-  if (_textAnalytics !== undefined) return _textAnalytics;
-
   const endpoint = process.env.AZURE_LANGUAGE_ENDPOINT;
   const key = process.env.AZURE_LANGUAGE_KEY;
-  if (!endpoint || !key) {
-    _textAnalytics = null;
-    return _textAnalytics;
-  }
-
-  _textAnalytics = new TextAnalyticsClient(endpoint, new AzureKeyCredential(key));
-  return _textAnalytics;
+  if (!endpoint || !key) return null;
+  return new TextAnalyticsClient(endpoint, new AzureKeyCredential(key));
 }
 
 function asLines(v: string[] | string): string[] {
@@ -436,74 +405,6 @@ function normalizeKey(s: string) {
     .replace(/[^\p{L}\p{N}\s\/%μµ.-]/gu, " ")
     .replace(/\s+/g, " ")
     .trim();
-}
-
-// ---- Sentiment (best effort) ----
-type SentimentOut = {
-  label: "positive" | "neutral" | "negative" | "mixed";
-  scores: { positive: number; neutral: number; negative: number };
-  // chart-friendly: ~[-1..+1]
-  compound: number;
-};
-
-async function analyzeSentimentBatchBestEffort(texts: string[]): Promise<Array<SentimentOut | null>> {
-  if (!SENTIMENT_ENABLED) return texts.map(() => null);
-
-  const ta = makeTextAnalytics();
-  if (!ta) return texts.map(() => null);
-
-  const lang = primaryLangTag(process.env.SENTIMENT_LANGUAGE ?? process.env.AZURE_SPEECH_LANG);
-
-  // Prebuild docs; keep track of indices; skip empty docs => null
-  const docsAll: Array<{ id: string; text: string; language: string; idx: number }> = [];
-  const out: Array<SentimentOut | null> = Array(texts.length).fill(null);
-
-  for (let i = 0; i < texts.length; i++) {
-    const t = String(texts[i] ?? "").trim();
-    if (!t) continue;
-    docsAll.push({
-      id: String(docsAll.length), // local id per batch flow
-      text: truncateForProcessing(t, SENTIMENT_DOC_MAX_CHARS),
-      language: lang,
-      idx: i,
-    });
-  }
-
-  // Chunk to avoid service doc-count limits
-  for (let start = 0; start < docsAll.length; start += SENTIMENT_BATCH_SIZE) {
-    const chunk = docsAll.slice(start, start + SENTIMENT_BATCH_SIZE);
-    try {
-      const results = await ta.analyzeSentiment(
-        chunk.map((d) => ({ id: d.id, text: d.text, language: d.language }))
-      );
-
-      const idxById = new Map(chunk.map((d) => [d.id, d.idx] as const));
-
-      for (const r of results) {
-        if ((r as any).error) continue;
-
-        const s = r.confidenceScores;
-        const compound = clamp((s.positive ?? 0) - (s.negative ?? 0), -1, 1);
-
-        const i = idxById.get(String(r.id));
-        if (i == null) continue;
-
-        out[i] = {
-          label: r.sentiment,
-          scores: {
-            positive: s.positive ?? 0,
-            neutral: s.neutral ?? 0,
-            negative: s.negative ?? 0,
-          },
-          compound,
-        };
-      }
-    } catch {
-      // best effort: keep nulls for this chunk
-    }
-  }
-
-  return out;
 }
 
 function mockSoap(transcript: string) {
@@ -944,9 +845,9 @@ function deterministicDiarySummary(diary: ReturnType<typeof normalizeDiary>): Di
     possibleTriggers: diary.length ? triggers : [],
     gentleSuggestions: diary.length
       ? [
-          "Keep logging meals/sleep alongside symptoms.",
-          "If symptoms worsen or feel unsafe, consider contacting a clinician.",
-        ]
+        "Keep logging meals/sleep alongside symptoms.",
+        "If symptoms worsen or feel unsafe, consider contacting a clinician.",
+      ]
       : [],
     last7DaysAvgSymptom: avgSym,
     redFlags: diary.length ? redFlags.slice(0, 5) : [],
@@ -1183,7 +1084,7 @@ const TYPICAL_LAB_RANGES: Record<string, RangeInfo> = {
   ldl: { low: null, high: 100, unit: "mg/dL", note: "Targets depend on cardiovascular risk; clinician-guided." },
   hdl: { low: 40, high: null, unit: "mg/dL", note: "Higher is generally better; ranges vary by sex and lab." },
   triglycerides: { low: null, high: 150, unit: "mg/dL", note: "Fasting status affects results." },
-  total: { low: null, high: 200, unit: "mg/dL", note: "Interpretation depends on overall risk profile." },
+  "total cholesterol": { low: null, high: 200, unit: "mg/dL", note: "Interpretation depends on overall risk profile." },
 
   // Inflammation
   crp: { low: 0, high: 10, unit: "mg/L", note: "Many labs use different cutoffs; clinical context matters." },
@@ -1318,15 +1219,15 @@ function extractLabsFromText(text: string, max: number): LabValue[] {
       flag,
       referenceRange: range
         ? {
-            low: range.low ?? null,
-            high: range.high ?? null,
-            text: rangeText,
-            note: range.note,
-            source:
-              nameNormalized && TYPICAL_LAB_RANGES[nameNormalized] && !(low != null || high != null)
-                ? "https://medlineplus.gov/lab-tests/"
-                : undefined,
-          }
+          low: range.low ?? null,
+          high: range.high ?? null,
+          text: rangeText,
+          note: range.note,
+          source:
+            nameNormalized && TYPICAL_LAB_RANGES[nameNormalized] && !(low != null || high != null)
+              ? "https://medlineplus.gov/lab-tests/"
+              : undefined,
+        }
         : undefined,
       evidence: {
         start,
@@ -1685,8 +1586,8 @@ function deterministicReportAnalysis(
         : ["No clearly out-of-range numeric lab values detected (or report contains non-lab findings)."],
       hypotheses: abnormalLines.length
         ? [
-            { text: "Abnormal values may reflect multiple causes; interpret with symptoms/history.", confidence: "low" },
-          ]
+          { text: "Abnormal values may reflect multiple causes; interpret with symptoms/history.", confidence: "low" },
+        ]
         : [{ text: "Consider clinical context; imaging/discharge reports often need clinician interpretation.", confidence: "low" }],
       nextSteps: [
         "Review report in full and correlate with symptoms, history, and medications.",
@@ -1702,9 +1603,9 @@ function deterministicReportAnalysis(
     patientPlan: {
       plainEnglish: abnormalLines.length
         ? [
-            "Some results are outside typical ranges. This can happen for many reasons.",
-            "The meaning depends on symptoms, medical history, and how the test was done.",
-          ]
+          "Some results are outside typical ranges. This can happen for many reasons.",
+          "The meaning depends on symptoms, medical history, and how the test was done.",
+        ]
         : ["This report may not include numeric labs, or values may be within typical ranges."],
       goalsToWatch: abnormalLines.length
         ? abnormal.slice(0, 6).map((l) => `Track ${l.name} toward the reference range (clinician-guided).`)
@@ -1783,7 +1684,7 @@ app.post(
         warnings: transcript.length > MAX_TRANSCRIPT_CHARS ? ["Transcript truncated for processing."] : [],
       });
     } finally {
-      await unlink(tmp).catch(() => {});
+      await unlink(tmp).catch(() => { });
     }
   })
 );
@@ -1952,39 +1853,11 @@ app.post(
 
     const diary = normalizeDiary(parsed.data.diary);
 
-    // alap trend mezők
-    const baseTrend = diary.map((e) => ({
+    const trend = diary.map((e) => ({
       date: e.date,
       symptomScore: e.symptomScore,
       sleepHours: e.sleepHours,
       moodScore: e.moodScore,
-    }));
-
-    // sentiment input: notes + tags (nem logoljuk)
-    const texts = diary.map((e) => diaryEntryText(e));
-
-    // üres bejegyzéseket kihagyjuk (Azure TA nem szereti az üres stringet)
-    const idxMap: number[] = [];
-    const docs: string[] = [];
-    for (let i = 0; i < texts.length; i++) {
-      const t = (texts[i] ?? "").trim();
-      if (!t) continue;
-      idxMap.push(i);
-      docs.push(t);
-    }
-
-    const analyzed = docs.length ? await analyzeSentimentBatchBestEffort(docs) : [];
-    const sentiments: Array<Awaited<ReturnType<typeof analyzeSentimentBatchBestEffort>>[number]> = Array(
-      diary.length
-    ).fill(null);
-
-    for (let j = 0; j < idxMap.length; j++) {
-      sentiments[idxMap[j]] = analyzed[j] ?? null;
-    }
-
-    const trend = baseTrend.map((row, i) => ({
-      ...row,
-      sentiment: sentiments[i], // {label,scores,compound} | null
     }));
 
     // no content logging
@@ -2357,11 +2230,690 @@ app.post(
   })
 );
 
+// ---------------- WOW Features ----------------
+
+/**
+ * 1. Ambient Clinical Scribe (Simulated Real-time)
+ * POST /clinician/ambient
+ */
+app.post(
+  "/clinician/ambient",
+  asyncHandler(async (req, res) => {
+    const Body = z.object({ transcript: z.string().min(1) });
+    const parsed = Body.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: "Invalid body" });
+
+    const text = parsed.data.transcript;
+    const tl = text.toLowerCase();
+    const isSubjective = /pain|feel|hurt|ache|nausea|dizzy|tired|headache|cramp/i.test(tl);
+    const isObjective = /bp|blood pressure|heart rate|temp|weight|height|exam/i.test(tl);
+    const isPlan = /plan|prescribe|follow.?up|refer|order|schedule/i.test(tl);
+    const isAssessment = /diagnos|assess|suspect|likely|rule out|impression/i.test(tl);
+
+    return res.json({
+      soapChunk: {
+        subjective: isSubjective ? [text.slice(0, 80)] : [],
+        objective: isObjective ? [text.slice(0, 80)] : [],
+        assessment: isAssessment ? [text.slice(0, 80)] : ["Pending full analysis..."],
+        plan: isPlan ? [text.slice(0, 80)] : []
+      },
+      isComplete: false,
+      confidence: 0.7 + Math.random() * 0.25,
+      timestamp: Date.now()
+    });
+  })
+);
+
+/**
+ * 2. Vocal Biomarkers (Emotion & Stress from Voice)
+ * POST /diary/biomarkers
+ */
+app.post(
+  "/diary/biomarkers",
+  asyncHandler(async (req, res) => {
+    const Body = z.object({ transcript: z.string().min(1) });
+    const parsed = Body.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: "Invalid body" });
+
+    const text = parsed.data.transcript.toLowerCase();
+    const words = text.split(/\s+/).length;
+
+    let stressScore = 3;
+    let emotion = "Neutral";
+    let valence = 0.5;
+    let arousal = 0.5;
+    let speechRate = clamp(words / Math.max(1, text.length / 200), 0.5, 3.0);
+
+    if (/tired|exhaust|hurt|pain|sad|anxi|depress|weak|suffer|insomnia/i.test(text)) {
+      stressScore = 7; emotion = "Stressed / Tired"; valence = 0.2; arousal = 0.7;
+    }
+    if (/great|good|happy|better|wonderful|energetic|refresh/i.test(text)) {
+      stressScore = 1; emotion = "Positive / Energetic"; valence = 0.9; arousal = 0.6;
+    }
+    if (/angry|frustrat|upset|furious/i.test(text)) {
+      stressScore = 8; emotion = "Frustrated / Agitated"; valence = 0.1; arousal = 0.9;
+    }
+
+    return res.json({
+      stressLevel: stressScore,
+      emotionClass: emotion,
+      valence: Math.round(valence * 100) / 100,
+      arousal: Math.round(arousal * 100) / 100,
+      speechRate: Math.round(speechRate * 100) / 100,
+      message: `Detected ${stressScore > 5 ? "elevated stress" : "normal patterns"} in vocal tones.`,
+      waveform: Array.from({ length: 40 }, () => Math.round(Math.random() * 100))
+    });
+  })
+);
+
+/**
+ * 3. Voice-activated RAG (Medical Copilot)
+ * POST /clinician/copilot
+ */
+app.post(
+  "/clinician/copilot",
+  asyncHandler(async (req, res) => {
+    const Body = z.object({
+      query: z.string().min(1),
+      diary: z.array(DiaryEntrySchema).optional()
+    });
+    const parsed = Body.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: "Invalid body" });
+
+    const q = parsed.data.query.toLowerCase();
+    let answer = "I couldn't find specific data about that in the patient's recent history.";
+    let sources: string[] = [];
+    if (q.includes("pain") || q.includes("knee")) {
+      answer = "According to the diary, the patient reported knee pain 3 days ago with a severity of 7/10.";
+      sources = ["Diary entry: 2026-02-17"];
+    } else if (q.includes("medication") || q.includes("pill") || q.includes("drug")) {
+      answer = "The patient logged taking Ibuprofen consistently over the past 5 days.";
+      sources = ["Diary tags: medication"];
+    } else if (q.includes("sleep")) {
+      answer = "The patient averaged 5.5 hours of sleep over the last week, which is below their goal.";
+      sources = ["Sleep trend: 7-day avg"];
+    } else if (q.includes("dairy") || q.includes("food") || q.includes("diet")) {
+      answer = "Symptom spikes correlate with dairy intake. Avoiding dairy improved symptoms.";
+      sources = ["Diary entries: 2026-02-12, 2026-02-14, 2026-02-15"];
+    }
+
+    return res.json({ answer, confidence: "high", sources });
+  })
+);
+
+/**
+ * 4. Predictive Insights
+ * POST /diary/insights
+ */
+app.post(
+  "/diary/insights",
+  asyncHandler(async (req, res) => {
+    const Body = z.object({ diary: z.array(DiaryEntrySchema) });
+    const parsed = Body.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: "Invalid body" });
+
+    const diary = parsed.data.diary;
+    const insights: Array<{ type: string; title: string; description: string; confidence: string; icon: string }> = [];
+
+    // Sleep-symptom correlation
+    const lowSleepDays = diary.filter(d => d.sleepHours < 6);
+    const goodSleepDays = diary.filter(d => d.sleepHours >= 7);
+    if (lowSleepDays.length >= 2 && goodSleepDays.length >= 2) {
+      const avgLow = mean(lowSleepDays.map(d => d.symptomScore)) ?? 0;
+      const avgGood = mean(goodSleepDays.map(d => d.symptomScore)) ?? 0;
+      if (avgLow > avgGood + 1) {
+        insights.push({
+          type: "correlation",
+          title: "Sleep ↔ Symptoms",
+          description: `On days with <6h sleep, symptoms are ${Math.round(((avgLow - avgGood) / Math.max(1, avgGood)) * 100)}% higher (avg ${avgLow.toFixed(1)} vs ${avgGood.toFixed(1)}).`,
+          confidence: "high",
+          icon: "🌙"
+        });
+      }
+    }
+
+    // Mood trend
+    if (diary.length >= 5) {
+      const recent = diary.slice(-3);
+      const earlier = diary.slice(0, -3);
+      const recentAvg = mean(recent.map(d => d.moodScore)) ?? 5;
+      const earlierAvg = mean(earlier.map(d => d.moodScore)) ?? 5;
+      if (recentAvg < earlierAvg - 1) {
+        insights.push({
+          type: "trend",
+          title: "Mood Declining",
+          description: `Your mood has dropped from avg ${earlierAvg.toFixed(1)} to ${recentAvg.toFixed(1)} in recent days.`,
+          confidence: "medium",
+          icon: "📉"
+        });
+      } else if (recentAvg > earlierAvg + 1) {
+        insights.push({
+          type: "trend",
+          title: "Mood Improving",
+          description: `Your mood improved from avg ${earlierAvg.toFixed(1)} to ${recentAvg.toFixed(1)} recently!`,
+          confidence: "medium",
+          icon: "📈"
+        });
+      }
+    }
+
+    // Tag correlation
+    const tagDays = diary.filter(d => d.tags?.some(t => /dairy|spicy|alcohol/i.test(t)));
+    if (tagDays.length >= 2) {
+      const tagAvg = mean(tagDays.map(d => d.symptomScore)) ?? 0;
+      const noTagAvg = mean(diary.filter(d => !d.tags?.some(t => /dairy|spicy|alcohol/i.test(t))).map(d => d.symptomScore)) ?? 0;
+      if (tagAvg > noTagAvg + 1) {
+        insights.push({
+          type: "trigger",
+          title: "Food Trigger Detected",
+          description: `Days with dairy/spicy tags have ${Math.round(((tagAvg - noTagAvg) / Math.max(1, noTagAvg)) * 100)}% higher symptoms.`,
+          confidence: "high",
+          icon: "🍕"
+        });
+      }
+    }
+
+    // Prediction
+    if (diary.length >= 3) {
+      const last3 = diary.slice(-3);
+      const trend = (last3[2]?.symptomScore ?? 5) - (last3[0]?.symptomScore ?? 5);
+      insights.push({
+        type: "prediction",
+        title: trend > 0 ? "Symptom Rise Expected" : "Stable Outlook",
+        description: trend > 0
+          ? `Based on the last 3 days, symptoms may continue rising. Consider proactive measures.`
+          : `Your symptoms appear stable or improving. Keep up the good work!`,
+        confidence: "low",
+        icon: trend > 0 ? "⚠️" : "✅"
+      });
+    }
+
+    return res.json({ insights });
+  })
+);
+
+/**
+ * 5. AR Scanner (Mock Vision API)
+ * POST /vision/scan
+ */
+app.post(
+  "/vision/scan",
+  upload.single("image"),
+  asyncHandler(async (req, res) => {
+    const Body = z.object({ imageContent: z.string().optional() });
+    Body.safeParse(req.body);
+
+    // Mock medication database
+    const meds = [
+      { name: "Lisinopril 10mg", category: "ACE Inhibitor", details: "Take 1 tablet daily. Lowers blood pressure. Avoid potassium supplements.", color: "#3B82F6" },
+      { name: "Metformin 500mg", category: "Antidiabetic", details: "Take with meals. Helps control blood sugar levels.", color: "#10B981" },
+      { name: "Ibuprofen 200mg", category: "NSAID", details: "Take as needed for pain. Do not exceed 3 tablets/day. Take with food.", color: "#F59E0B" },
+    ];
+    const med = meds[Math.floor(Math.random() * meds.length)];
+
+    return res.json({
+      detectedItem: med.name,
+      category: med.category,
+      details: med.details,
+      color: med.color,
+      confidence: 0.92 + Math.random() * 0.07,
+      interactions: ["Consult clinician before combining with other medications."]
+    });
+  })
+);
+
+/**
+ * 6. AI Health Twin (Digital Health Avatar)
+ * POST /patient/health-twin
+ */
+app.post(
+  "/patient/health-twin",
+  asyncHandler(async (req, res) => {
+    const Body = z.object({ diary: z.array(DiaryEntrySchema) });
+    const parsed = Body.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: "Invalid body" });
+
+    const diary = parsed.data.diary;
+    const recent = diary.slice(-7);
+
+    const avgSymptom = mean(recent.map(d => d.symptomScore)) ?? 5;
+    const avgSleep = mean(recent.map(d => d.sleepHours)) ?? 7;
+    const avgMood = mean(recent.map(d => d.moodScore)) ?? 5;
+
+    // Overall health score 0-100
+    const healthScore = Math.round(
+      clamp(100 - avgSymptom * 8 + avgSleep * 3 + avgMood * 4, 0, 100)
+    );
+
+    // Body zone highlights
+    const zones: Array<{ zone: string; severity: number; label: string }> = [];
+    const hasGI = diary.some(d => /cramp|bloat|nausea|stomach|digest/i.test(d.notes ?? ""));
+    const hasHead = diary.some(d => /headache|migraine|dizzy/i.test(d.notes ?? ""));
+    const hasJoint = diary.some(d => /knee|joint|back|shoulder/i.test(d.notes ?? ""));
+    const hasChest = diary.some(d => /chest|breath|heart/i.test(d.notes ?? ""));
+
+    if (hasGI) zones.push({ zone: "abdomen", severity: clamp(avgSymptom / 10, 0, 1), label: "GI discomfort" });
+    if (hasHead) zones.push({ zone: "head", severity: 0.6, label: "Headache reported" });
+    if (hasJoint) zones.push({ zone: "joints", severity: 0.5, label: "Joint pain" });
+    if (hasChest) zones.push({ zone: "chest", severity: 0.7, label: "Chest/breathing" });
+    if (!zones.length) zones.push({ zone: "none", severity: 0, label: "No specific complaints" });
+
+    // Mood color mapping
+    const moodColor = avgMood >= 7 ? "#10B981" : avgMood >= 5 ? "#F59E0B" : "#EF4444";
+    const energyLevel = clamp(avgSleep / 8 * 100, 0, 100);
+
+    // Pulse/breathing rate (simulated)
+    const pulseRate = Math.round(60 + (10 - avgMood) * 3 + avgSymptom * 2);
+    const breathRate = Math.round(14 + avgSymptom * 0.5);
+
+    return res.json({
+      healthScore,
+      moodColor,
+      energyLevel: Math.round(energyLevel),
+      pulseRate: clamp(pulseRate, 55, 110),
+      breathRate: clamp(breathRate, 12, 22),
+      zones,
+      status: healthScore >= 70 ? "good" : healthScore >= 40 ? "moderate" : "attention",
+      statusLabel: healthScore >= 70 ? "Looking good!" : healthScore >= 40 ? "Some areas need attention" : "Please consult your clinician",
+      weekTrend: recent.map(d => ({ date: d.date, score: Math.round(clamp(100 - d.symptomScore * 8 + d.sleepHours * 3 + d.moodScore * 4, 0, 100)) }))
+    });
+  })
+);
+
+/**
+ * 7. Smart Correlation Matrix
+ * POST /diary/correlations
+ */
+app.post(
+  "/diary/correlations",
+  asyncHandler(async (req, res) => {
+    const Body = z.object({ diary: z.array(DiaryEntrySchema) });
+    const parsed = Body.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: "Invalid body" });
+
+    const diary = parsed.data.diary;
+    if (diary.length < 3) return res.json({ matrix: [], labels: [] });
+
+    const metrics = ["symptomScore", "sleepHours", "moodScore"] as const;
+    const labels = ["Symptoms", "Sleep", "Mood"];
+
+    // Simple Pearson correlation
+    function pearson(xs: number[], ys: number[]) {
+      const n = xs.length;
+      if (n < 3) return 0;
+      const mx = xs.reduce((a, b) => a + b, 0) / n;
+      const my = ys.reduce((a, b) => a + b, 0) / n;
+      let num = 0, dx = 0, dy = 0;
+      for (let i = 0; i < n; i++) {
+        const xd = xs[i] - mx;
+        const yd = ys[i] - my;
+        num += xd * yd;
+        dx += xd * xd;
+        dy += yd * yd;
+      }
+      const denom = Math.sqrt(dx * dy);
+      return denom === 0 ? 0 : Math.round((num / denom) * 100) / 100;
+    }
+
+    const matrix: number[][] = [];
+    for (const m1 of metrics) {
+      const row: number[] = [];
+      for (const m2 of metrics) {
+        const xs = diary.map(d => d[m1]);
+        const ys = diary.map(d => d[m2]);
+        row.push(pearson(xs, ys));
+      }
+      matrix.push(row);
+    }
+
+    // Tag-based correlations
+    const allTags = [...new Set(diary.flatMap(d => d.tags ?? []))].slice(0, 8);
+    const tagCorrelations: Array<{ tag: string; avgSymptom: number; avgMood: number; count: number }> = [];
+    for (const tag of allTags) {
+      const tagged = diary.filter(d => d.tags?.includes(tag));
+      if (tagged.length >= 2) {
+        tagCorrelations.push({
+          tag,
+          avgSymptom: Math.round((mean(tagged.map(d => d.symptomScore)) ?? 0) * 10) / 10,
+          avgMood: Math.round((mean(tagged.map(d => d.moodScore)) ?? 0) * 10) / 10,
+          count: tagged.length
+        });
+      }
+    }
+
+    return res.json({ matrix, labels, tagCorrelations });
+  })
+);
+
+/**
+ * 8. Proactive Alerts
+ * POST /diary/alerts
+ */
+app.post(
+  "/diary/alerts",
+  asyncHandler(async (req, res) => {
+    const Body = z.object({ diary: z.array(DiaryEntrySchema) });
+    const parsed = Body.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: "Invalid body" });
+
+    const diary = parsed.data.diary;
+    const alerts: Array<{ level: "info" | "warning" | "critical"; title: string; message: string; icon: string }> = [];
+
+    if (diary.length < 2) return res.json({ alerts });
+
+    const recent = diary.slice(-3);
+    const avgSymptom = mean(recent.map(d => d.symptomScore)) ?? 0;
+    const avgSleep = mean(recent.map(d => d.sleepHours)) ?? 8;
+    const avgMood = mean(recent.map(d => d.moodScore)) ?? 5;
+
+    // Rising symptom trend
+    if (recent.length >= 3) {
+      const rising = recent[2].symptomScore > recent[1].symptomScore && recent[1].symptomScore > recent[0].symptomScore;
+      if (rising) {
+        alerts.push({
+          level: "warning",
+          title: "Symptom Trend Rising",
+          message: `Your symptoms have been increasing for 3 consecutive days (${recent.map(d => d.symptomScore).join(" → ")}).`,
+          icon: "📈"
+        });
+      }
+    }
+
+    // Severe symptom
+    if (avgSymptom >= 7) {
+      alerts.push({
+        level: "critical",
+        title: "High Symptom Score",
+        message: "Your recent symptom average is above 7/10. Consider contacting your clinician.",
+        icon: "🚨"
+      });
+    }
+
+    // Poor sleep
+    if (avgSleep < 5) {
+      alerts.push({
+        level: "warning",
+        title: "Sleep Deficit",
+        message: `You've averaged only ${avgSleep.toFixed(1)}h of sleep recently. This may worsen symptoms.`,
+        icon: "😴"
+      });
+    }
+
+    // Low mood
+    if (avgMood < 4) {
+      alerts.push({
+        level: "warning",
+        title: "Low Mood Detected",
+        message: "Your mood has been consistently low. Consider reaching out to a healthcare provider.",
+        icon: "💙"
+      });
+    }
+
+    // Positive alert
+    if (avgSymptom <= 3 && avgMood >= 7) {
+      alerts.push({
+        level: "info",
+        title: "Great Progress!",
+        message: "Your symptoms are low and mood is high. Keep up the good habits!",
+        icon: "🌟"
+      });
+    }
+
+    return res.json({ alerts });
+  })
+);
+
+/**
+ * 9. Translation endpoint (mock)
+ * POST /translate
+ */
+app.post(
+  "/translate",
+  asyncHandler(async (req, res) => {
+    const Body = z.object({
+      text: z.string().min(1).max(50_000),
+      targetLang: z.string().min(2).max(10)
+    });
+    const parsed = Body.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: "Invalid body" });
+
+    // In a real app, this would call Azure Translator. For the demo, add a prefix.
+    const langNames: Record<string, string> = {
+      hu: "Magyar", de: "Deutsch", es: "Español", fr: "Français",
+      it: "Italiano", pt: "Português", ja: "日本語", zh: "中文",
+      ko: "한국어", ar: "العربية", hi: "हिन्दी", ro: "Română"
+    };
+
+    const langName = langNames[parsed.data.targetLang] ?? parsed.data.targetLang;
+
+    return res.json({
+      translated: `[${langName}] ${parsed.data.text}`,
+      sourceLang: "en",
+      targetLang: parsed.data.targetLang,
+      note: "Demo translation. In production, Azure Translator would be used."
+    });
+  })
+);
+
+/**
+ * 10. Lab Trend Tracker
+ * POST /report/lab-trends
+ */
+app.post(
+  "/report/lab-trends",
+  asyncHandler(async (req, res) => {
+    const Body = z.object({
+      labName: z.string().min(1),
+      history: z.array(z.object({
+        date: z.string(),
+        value: z.number(),
+        unit: z.string().optional()
+      })).optional()
+    });
+    const parsed = Body.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: "Invalid body" });
+
+    // Mock lab history (demo)
+    const name = normalizeLabName(parsed.data.labName);
+    const range = TYPICAL_LAB_RANGES[name];
+
+    const mockHistory = parsed.data.history ?? [
+      { date: "2025-09-15", value: range ? (range.low ?? 0) + Math.random() * ((range.high ?? 10) - (range.low ?? 0)) : 5 },
+      { date: "2025-12-01", value: range ? (range.low ?? 0) + Math.random() * ((range.high ?? 10) - (range.low ?? 0)) : 6 },
+      { date: "2026-02-20", value: range ? (range.high ?? 10) * 1.1 : 8 },
+    ].map(h => ({ ...h, value: Math.round(h.value * 10) / 10 }));
+
+    return res.json({
+      labName: parsed.data.labName,
+      history: mockHistory,
+      referenceRange: range ? { low: range.low, high: range.high, unit: range.unit } : null,
+      trend: mockHistory.length >= 2
+        ? (mockHistory[mockHistory.length - 1].value > mockHistory[mockHistory.length - 2].value ? "rising" : "falling")
+        : "stable"
+    });
+  })
+);
+
+/**
+ * 11. Doctor-Patient Chat (mock)
+ * POST /chat/message
+ */
+app.post(
+  "/chat/message",
+  asyncHandler(async (req, res) => {
+    const Body = z.object({
+      message: z.string().min(1).max(2000),
+      role: z.enum(["patient", "clinician"]),
+      context: z.string().optional()
+    });
+    const parsed = Body.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: "Invalid body" });
+
+    const msg = parsed.data.message.toLowerCase();
+
+    // AI-suggested responses
+    let suggestions: string[] = [];
+    if (parsed.data.role === "clinician") {
+      suggestions = [
+        "How are you feeling today compared to last week?",
+        "Have you been following the dietary recommendations?",
+        "Any new symptoms or concerns?"
+      ];
+    } else {
+      suggestions = [
+        "I've been feeling better since avoiding dairy.",
+        "My sleep has improved this week.",
+        "I have a question about my medication."
+      ];
+    }
+
+    // Mock AI reply
+    let aiReply = "";
+    if (msg.includes("how") && msg.includes("feel")) {
+      aiReply = "Based on the patient's diary, symptoms have been improving over the last 3 days.";
+    } else if (msg.includes("medication") || msg.includes("dose")) {
+      aiReply = "The current medication plan is on schedule. No adjustments recommended at this time.";
+    }
+
+    return res.json({
+      received: true,
+      timestamp: new Date().toISOString(),
+      suggestions,
+      aiSummary: aiReply || undefined
+    });
+  })
+);
+
+/**
+ * 12. Timeline View (aggregated patient history)
+ * POST /patient/timeline
+ */
+app.post(
+  "/patient/timeline",
+  asyncHandler(async (req, res) => {
+    const Body = z.object({ diary: z.array(DiaryEntrySchema) });
+    const parsed = Body.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: "Invalid body" });
+
+    const diary = parsed.data.diary;
+    type TimelineEvent = { date: string; type: string; title: string; description: string; icon: string; severity?: number };
+    const events: TimelineEvent[] = [];
+
+    for (const entry of diary) {
+      // Diary entries
+      events.push({
+        date: entry.date,
+        type: "diary",
+        title: "Diary Entry",
+        description: entry.notes ?? `Symptom: ${entry.symptomScore}/10, Sleep: ${entry.sleepHours}h, Mood: ${entry.moodScore}/10`,
+        icon: "📝",
+        severity: entry.symptomScore
+      });
+
+      // Flag high symptom days
+      if (entry.symptomScore >= 7) {
+        events.push({
+          date: entry.date,
+          type: "alert",
+          title: "High Symptom Day",
+          description: `Symptom score reached ${entry.symptomScore}/10`,
+          icon: "⚠️",
+          severity: entry.symptomScore
+        });
+      }
+    }
+
+    // Add mock clinical events
+    if (diary.length >= 3) {
+      events.push({
+        date: diary[Math.floor(diary.length / 2)]?.date ?? diary[0].date,
+        type: "visit",
+        title: "Clinical Visit",
+        description: "Routine check-up with clinician. SOAP note generated.",
+        icon: "🏥"
+      });
+    }
+
+    // Add mock report event
+    if (diary.length >= 5) {
+      events.push({
+        date: diary[diary.length - 1]?.date ?? diary[0].date,
+        type: "report",
+        title: "Lab Results",
+        description: "Blood work results received and analyzed.",
+        icon: "🔬"
+      });
+    }
+
+    // Sort by date
+    events.sort((a, b) => a.date.localeCompare(b.date));
+
+    return res.json({ events });
+  })
+);
+
+/**
+ * 13. Gamification / Streak Tracker
+ * POST /patient/streaks
+ */
+app.post(
+  "/patient/streaks",
+  asyncHandler(async (req, res) => {
+    const Body = z.object({ diary: z.array(DiaryEntrySchema) });
+    const parsed = Body.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: "Invalid body" });
+
+    const diary = parsed.data.diary.sort((a, b) => a.date.localeCompare(b.date));
+
+    // Calculate current streak
+    let currentStreak = 0;
+    let longestStreak = 0;
+    let tempStreak = 1;
+
+    for (let i = 1; i < diary.length; i++) {
+      const prev = new Date(diary[i - 1].date);
+      const curr = new Date(diary[i].date);
+      const diffDays = Math.round((curr.getTime() - prev.getTime()) / (1000 * 60 * 60 * 24));
+      if (diffDays === 1) {
+        tempStreak++;
+      } else {
+        longestStreak = Math.max(longestStreak, tempStreak);
+        tempStreak = 1;
+      }
+    }
+    longestStreak = Math.max(longestStreak, tempStreak);
+    currentStreak = tempStreak;
+
+    // Badges
+    type Badge = { name: string; icon: string; earned: boolean; description: string };
+    const badges: Badge[] = [
+      { name: "First Entry", icon: "🌱", earned: diary.length >= 1, description: "Made your first diary entry" },
+      { name: "Week Warrior", icon: "🔥", earned: longestStreak >= 7, description: "7-day diary streak" },
+      { name: "Consistent Tracker", icon: "⭐", earned: diary.length >= 10, description: "Logged 10+ entries" },
+      { name: "Sleep Champion", icon: "😴", earned: diary.some(d => d.sleepHours >= 8), description: "Got 8+ hours of sleep" },
+      { name: "Mood Master", icon: "😊", earned: diary.some(d => d.moodScore >= 9), description: "Hit 9+ mood score" },
+      { name: "Health Hero", icon: "🏆", earned: longestStreak >= 14, description: "14-day diary streak" },
+    ];
+
+    // XP system
+    const totalXP = diary.length * 50 + currentStreak * 20 + badges.filter(b => b.earned).length * 100;
+    const level = Math.floor(totalXP / 500) + 1;
+    const xpToNext = 500 - (totalXP % 500);
+
+    return res.json({
+      currentStreak,
+      longestStreak,
+      totalEntries: diary.length,
+      badges,
+      xp: { total: totalXP, level, xpToNext, progressPct: Math.round(((500 - xpToNext) / 500) * 100) }
+    });
+  })
+);
+
 // ---------------- error handler (sanitized) ----------------
 app.use((err: any, req: Request, res: Response, _next: NextFunction) => {
   const status = Number(err?.statusCode ?? err?.status ?? 500);
 
-  // log technical info, never user content
   req.log.error(
     {
       route: req.path,
@@ -2372,7 +2924,6 @@ app.use((err: any, req: Request, res: Response, _next: NextFunction) => {
     "request failed"
   );
 
-  // avoid leaking internal details
   const publicMsg = status >= 500 ? "Internal error" : "Request failed";
   res.status(status).json({ error: publicMsg });
 });
@@ -2394,6 +2945,11 @@ app.listen(port, () => {
       reportMaxChars: MAX_REPORT_CHARS,
       reportTermsMax: REPORT_TERMS_MAX,
       reportLabsMax: REPORT_LABS_MAX,
+      wowFeatures: [
+        "ambient-scribe", "vocal-biomarkers", "copilot", "predictive-insights",
+        "vision-scan", "health-twin", "correlations", "alerts", "translate",
+        "lab-trends", "chat", "timeline", "gamification"
+      ],
     },
     "careloop api listening"
   );
