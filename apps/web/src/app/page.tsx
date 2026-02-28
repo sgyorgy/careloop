@@ -2,13 +2,13 @@
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 type DiaryEntry = {
-  date: string; // YYYY-MM-DD
-  symptomScore: number; // 0-10
+  date: string;
+  symptomScore: number;
   sleepHours: number;
-  moodScore: number; // 0-10
+  moodScore: number;
   notes: string;
   tags?: string[];
 };
@@ -31,7 +31,6 @@ function clamp(n: number, lo: number, hi: number) {
 }
 
 function makeDemo(): DemoPayload {
-  // Small-but-rich synthetic dataset (no PHI)
   const base = [
     { d: "2026-02-10", s: 3, sl: 7.2, m: 7, t: ["ok"], n: "Felt mostly fine. Light headache in the afternoon." },
     { d: "2026-02-11", s: 4, sl: 6.1, m: 6, t: ["stress"], n: "Busy day. Mild stomach discomfort after lunch." },
@@ -61,8 +60,6 @@ function makeDemo(): DemoPayload {
     "Plan: trial lactose-free diet for 2 weeks, keep symptom diary, consider OTC lactase as needed, follow up in 2–3 weeks, " +
     "return sooner if worsening pain, fever, or blood in stool.";
 
-  // Synthetic “medical report” (no identifiers)
-  // Keep it text-first for hackathon stability; PDF upload can come later.
   const reportText = [
     "SYNTHETIC MEDICAL REPORT (DEMO — NO PHI)",
     "",
@@ -93,9 +90,21 @@ function makeDemo(): DemoPayload {
 export default function HomePage() {
   const router = useRouter();
   const [status, setStatus] = useState<"idle" | "loaded" | "error">("idle");
+  const [dark, setDark] = useState(false);
   const demo = useMemo(() => makeDemo(), []);
 
-  function loadDemoAndGo(path: "/patient" | "/clinician" | "/report") {
+  useEffect(() => {
+    setDark(document.documentElement.classList.contains("dark"));
+  }, []);
+
+  function toggleTheme() {
+    const next = !dark;
+    setDark(next);
+    document.documentElement.classList.toggle("dark", next);
+    try { localStorage.setItem("careloop.theme", next ? "dark" : "light"); } catch { }
+  }
+
+  function loadDemoAndGo(path: "/patient" | "/clinician" | "/report" | "/timeline") {
     try {
       localStorage.setItem(DEMO_KEYS.diary, JSON.stringify(demo.diary));
       localStorage.setItem(DEMO_KEYS.transcript, demo.clinicianTranscript);
@@ -120,174 +129,169 @@ export default function HomePage() {
     }
   }
 
+  const cards = [
+    {
+      title: "Patient mode",
+      desc: "Log symptoms, sleep, mood. See trends, AI Health Twin, gamification + pre-visit summary.",
+      icon: "🧬",
+      href: "/patient",
+      gradient: "from-emerald-500 to-teal-600",
+    },
+    {
+      title: "Clinician mode",
+      desc: "Ambient scribe, voice→SOAP notes, medical copilot, doctor-patient chat.",
+      icon: "🩺",
+      href: "/clinician",
+      gradient: "from-blue-500 to-indigo-600",
+    },
+    {
+      title: "Report interpreter",
+      desc: "Tap-to-explain, lab trend tracker, multi-language translation, values table.",
+      icon: "📋",
+      href: "/report",
+      gradient: "from-violet-500 to-purple-600",
+    },
+    {
+      title: "Timeline",
+      desc: "Full patient journey — diary, visits, labs, alerts — on one interactive timeline.",
+      icon: "⏱️",
+      href: "/timeline",
+      gradient: "from-amber-500 to-orange-600",
+    },
+  ];
+
   return (
-    <main className="min-h-screen bg-gradient-to-b from-white to-slate-50">
+    <main className="min-h-screen">
       <div className="mx-auto max-w-6xl px-6 py-10">
         <header className="flex items-start justify-between gap-6">
           <div>
-            <div className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-3 py-1 text-xs text-slate-700 shadow-sm">
-              <span className="inline-block h-2 w-2 rounded-full bg-emerald-500" />
+            <div className="inline-flex items-center gap-2 rounded-full border border-slate-200 dark:border-slate-700 bg-white/80 dark:bg-slate-800/80 backdrop-blur px-3 py-1 text-xs text-slate-700 dark:text-slate-300 shadow-sm">
+              <span className="inline-block h-2 w-2 rounded-full bg-emerald-500 animate-pulse" />
               Hackathon Prototype • No PHI • Synthetic demo
             </div>
 
-            <h1 className="mt-4 text-4xl font-semibold tracking-tight text-slate-900 sm:text-5xl">CareLoop</h1>
+            <h1 className="mt-4 text-4xl font-bold tracking-tight sm:text-5xl">
+              <span className="gradient-text">CareLoop</span>
+            </h1>
 
-            <p className="mt-3 max-w-2xl text-base text-slate-700 sm:text-lg">
-              Diary insights + voice-to-SOAP clinical notes + medical report interpretation — connected in one closed loop
-              so plans become actionable tracking.
+            <p className="mt-3 max-w-2xl text-base text-slate-600 dark:text-slate-400 sm:text-lg">
+              AI-powered closed-loop health platform — diary insights, voice-to-SOAP notes, report interpretation, predictive analytics & more.
             </p>
           </div>
 
-          <div className="hidden sm:flex flex-col items-end gap-2">
-            <Link href="/privacy" className="text-sm text-slate-700 underline underline-offset-4 hover:text-slate-900">
+          <div className="flex flex-col items-end gap-3">
+            <button
+              onClick={toggleTheme}
+              className="group relative inline-flex items-center gap-2 rounded-full bg-slate-900 dark:bg-white px-4 py-2 text-sm font-medium text-white dark:text-slate-900 shadow-lg hover:shadow-xl transition-all duration-300 hover:scale-105"
+              title="Toggle dark/light mode"
+            >
+              <span className="text-lg transition-transform duration-300 group-hover:rotate-180">{dark ? "☀️" : "🌙"}</span>
+              {dark ? "Light" : "Dark"}
+            </button>
+            <Link href="/privacy" className="text-sm text-slate-600 dark:text-slate-400 underline underline-offset-4 hover:text-slate-900 dark:hover:text-white transition-colors">
               Privacy & Safety
             </Link>
-            <div className="text-xs text-slate-500">
-              Tip: set <code className="rounded bg-slate-100 px-1">API_PROXY_TARGET</code> to use{" "}
-              <code className="rounded bg-slate-100 px-1">/api/*</code>
-            </div>
           </div>
         </header>
 
+        {/* Feature cards */}
         <section className="mt-10 grid gap-6 md:grid-cols-2 lg:grid-cols-4">
-          <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
-            <h2 className="text-lg font-semibold text-slate-900">Patient mode</h2>
-            <p className="mt-2 text-sm text-slate-700">Log symptoms, sleep, mood. See trends + a pre-visit summary.</p>
-            <div className="mt-5 flex flex-wrap gap-3">
-              <Link
-                href="/patient"
-                className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-800"
-              >
-                Open Patient
-              </Link>
-              <button
-                onClick={() => loadDemoAndGo("/patient")}
-                className="rounded-xl border border-slate-200 bg-white px-4 py-2 text-sm font-medium text-slate-900 hover:bg-slate-50"
-              >
-                Load demo → Patient
-              </button>
+          {cards.map((card) => (
+            <div
+              key={card.href}
+              className="group card-glass p-6 hover:shadow-2xl transition-all duration-300 hover:-translate-y-1 cursor-pointer"
+            >
+              <div className={`inline-flex items-center justify-center w-12 h-12 rounded-xl bg-gradient-to-br ${card.gradient} text-white text-2xl shadow-lg mb-4 group-hover:scale-110 transition-transform`}>
+                {card.icon}
+              </div>
+              <h2 className="text-lg font-semibold text-slate-900 dark:text-white">{card.title}</h2>
+              <p className="mt-2 text-sm text-slate-600 dark:text-slate-400">{card.desc}</p>
+              <div className="mt-5 flex flex-wrap gap-3">
+                <Link
+                  href={card.href}
+                  className={`rounded-xl bg-gradient-to-r ${card.gradient} px-4 py-2 text-sm font-medium text-white shadow-md hover:shadow-lg transition-all`}
+                >
+                  Open
+                </Link>
+                <button
+                  onClick={() => loadDemoAndGo(card.href as any)}
+                  className="rounded-xl border border-slate-200 dark:border-slate-700 bg-white/80 dark:bg-slate-800/80 px-4 py-2 text-sm font-medium text-slate-900 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors"
+                >
+                  Demo →
+                </button>
+              </div>
             </div>
-          </div>
+          ))}
+        </section>
 
-          <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
-            <h2 className="text-lg font-semibold text-slate-900">Clinician mode</h2>
-            <p className="mt-2 text-sm text-slate-700">
-              Dictate a visit. Generate a clean SOAP note (S/O/A/P) ready to review and export.
-            </p>
-            <div className="mt-5 flex flex-wrap gap-3">
-              <Link
-                href="/clinician"
-                className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-800"
-              >
-                Open Clinician
-              </Link>
-              <button
-                onClick={() => loadDemoAndGo("/clinician")}
-                className="rounded-xl border border-slate-200 bg-white px-4 py-2 text-sm font-medium text-slate-900 hover:bg-slate-50"
-              >
-                Load demo → Clinician
-              </button>
-            </div>
-          </div>
-
-          <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
-            <h2 className="text-lg font-semibold text-slate-900">Report interpreter</h2>
-            <p className="mt-2 text-sm text-slate-700">
-              Paste labs/findings. Tap-to-explain terms + “my values vs normal” table + draft summaries.
-            </p>
-            <div className="mt-5 flex flex-wrap gap-3">
-              <Link
-                href="/report"
-                className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-800"
-              >
-                Open Report
-              </Link>
-              <button
-                onClick={() => loadDemoAndGo("/report")}
-                className="rounded-xl border border-slate-200 bg-white px-4 py-2 text-sm font-medium text-slate-900 hover:bg-slate-50"
-              >
-                Load demo → Report
-              </button>
-            </div>
-          </div>
-
-          <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
-            <h2 className="text-lg font-semibold text-slate-900">Closed-loop plan</h2>
-            <p className="mt-2 text-sm text-slate-700">
-              Turn clinician outputs into patient tasks and reminders — the plan becomes trackable.
-            </p>
-            <div className="mt-5 flex flex-wrap gap-3">
-              <Link
-                href="/patient?tab=tasks"
-                className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-800"
-              >
-                View Tasks
-              </Link>
-              <Link
-                href="/privacy"
-                className="rounded-xl border border-slate-200 bg-white px-4 py-2 text-sm font-medium text-slate-900 hover:bg-slate-50"
-              >
-                Privacy panel
-              </Link>
-            </div>
+        {/* WOW Features showcase */}
+        <section className="mt-8 card-glass p-6">
+          <h3 className="text-lg font-bold text-slate-900 dark:text-white mb-4">✨ WOW Features</h3>
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+            {[
+              { icon: "🧬", name: "AI Health Twin", desc: "Animated digital avatar reflecting your health" },
+              { icon: "📊", name: "Correlation Matrix", desc: "Interactive symptom-sleep-mood heatmap" },
+              { icon: "🔔", name: "Proactive Alerts", desc: "AI-driven health warnings & encouragement" },
+              { icon: "🏅", name: "Gamification", desc: "Streaks, badges, XP & levels" },
+              { icon: "📈", name: "Predictive Insights", desc: "AI finds patterns in your data" },
+              { icon: "⏱️", name: "Timeline View", desc: "Your complete health journey" },
+              { icon: "🌍", name: "Multi-language", desc: "Instant translation of summaries" },
+              { icon: "📸", name: "Medication Scanner", desc: "AR-like medication recognition" },
+              { icon: "🗣️", name: "Ambient Scribe", desc: "Real-time SOAP note generation" },
+              { icon: "🤖", name: "Medical Copilot", desc: "AI answers about patient data" },
+              { icon: "💬", name: "Smart Chat", desc: "Doctor-patient messaging with AI" },
+              { icon: "🎤", name: "Vocal Biomarkers", desc: "Stress & emotion from voice" },
+            ].map((f) => (
+              <div key={f.name} className="flex items-center gap-3 rounded-xl p-3 bg-slate-50/50 dark:bg-slate-800/50 border border-slate-100 dark:border-slate-700/50 hover:bg-slate-100 dark:hover:bg-slate-700/50 transition-colors">
+                <span className="text-2xl">{f.icon}</span>
+                <div>
+                  <div className="text-sm font-semibold text-slate-900 dark:text-white">{f.name}</div>
+                  <div className="text-xs text-slate-500 dark:text-slate-400">{f.desc}</div>
+                </div>
+              </div>
+            ))}
           </div>
         </section>
 
-        <section className="mt-8 rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
+        {/* Demo controls */}
+        <section className="mt-8 card-glass p-6">
           <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <div>
-              <h3 className="text-base font-semibold text-slate-900">Demo controls</h3>
-              <p className="mt-1 text-sm text-slate-700">
-                This repo ships with synthetic-only demo data. No personal identifiers are stored or required.
+              <h3 className="text-base font-semibold text-slate-900 dark:text-white">Demo controls</h3>
+              <p className="mt-1 text-sm text-slate-600 dark:text-slate-400">
+                Synthetic-only demo data. No personal identifiers are stored or required.
               </p>
             </div>
 
             <div className="flex flex-wrap gap-3">
               <button
                 onClick={clearDemo}
-                className="rounded-xl border border-slate-200 bg-white px-4 py-2 text-sm font-medium text-slate-900 hover:bg-slate-50"
+                className="rounded-xl border border-slate-200 dark:border-slate-700 bg-white/80 dark:bg-slate-800/80 px-4 py-2 text-sm font-medium text-slate-900 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors"
               >
                 Clear demo data
               </button>
-
-              <Link
-                href="/patient?demo=1"
-                className="rounded-xl border border-slate-200 bg-white px-4 py-2 text-sm font-medium text-slate-900 hover:bg-slate-50"
-              >
-                Continue demo (Patient)
-              </Link>
-
-              <Link
-                href="/report?demo=1"
-                className="rounded-xl border border-slate-200 bg-white px-4 py-2 text-sm font-medium text-slate-900 hover:bg-slate-50"
-              >
-                Continue demo (Report)
-              </Link>
             </div>
           </div>
 
           {status !== "idle" && (
-            <div className="mt-4 rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-800">
+            <div className="mt-4 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 px-4 py-3 text-sm text-slate-800 dark:text-slate-200">
               {status === "loaded" && (
-                <span>✅ Demo data loaded into localStorage. Open Patient/Clinician/Report pages to see it.</span>
+                <span>✅ Demo data loaded. Open any page to explore WOW features.</span>
               )}
               {status === "error" && (
-                <span>
-                  ⚠️ Couldn’t access localStorage (private mode / policy). You can still use the app without demo
-                  loading.
-                </span>
+                <span>⚠️ Couldn&apos;t access localStorage (private mode / policy).</span>
               )}
             </div>
           )}
         </section>
 
-        <footer className="mt-10 flex flex-col gap-2 text-xs text-slate-500 sm:flex-row sm:items-center sm:justify-between">
+        <footer className="mt-10 flex flex-col gap-2 text-xs text-slate-500 dark:text-slate-500 sm:flex-row sm:items-center sm:justify-between">
           <div>
-            API calls are made to <code className="rounded bg-slate-100 px-1">/api/*</code> (proxy via{" "}
-            <code className="rounded bg-slate-100 px-1">API_PROXY_TARGET</code>).
+            API calls via <code className="rounded bg-slate-100 dark:bg-slate-800 px-1">/api/*</code> (proxy via{" "}
+            <code className="rounded bg-slate-100 dark:bg-slate-800 px-1">API_PROXY_TARGET</code>).
           </div>
           <div>
-            <span className="text-slate-400">CareLoop</span> • demo-first • schema-validated outputs • informational only
+            <span className="gradient-text font-semibold">CareLoop</span> • AI-powered • schema-validated • informational only
           </div>
         </footer>
       </div>
