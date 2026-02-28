@@ -911,156 +911,182 @@ function PatientPageContent() {
   }, [diary, enforcePhiGate, explainPiiGateFailure, redactionMode]);
 
   const generateSummary = useCallback(async () => {
-    setErr(null);
-    setNotes([]);
-    setBusy((b) => ({ ...b, summary: true }));
+  setErr(null);
+  setNotes([]);
+  setBusy((b) => ({ ...b, summary: true }));
 
+  summaryAbortRef.current?.abort();
+  summaryAbortRef.current = new AbortController();
+
+  let didTimeout = false;
+  const timeoutId = window.setTimeout(() => {
+    didTimeout = true;
     summaryAbortRef.current?.abort();
-    summaryAbortRef.current = new AbortController();
+  }, 15000);
+
+  try {
+    // PII gate
+    if (enforcePhiGate && redactionMode === "none") {
+      const anyPii = diary.some((e) => detectLikelyPii(e.notes));
+      if (anyPii) {
+        explainPiiGateFailure();
+        return;
+      }
+    }
+
+    // prepare payload (redaction)
+    const { diary: payloadDiary, piiDetected } = await prepareDiaryForApi(
+      diary,
+      redactionMode,
+      summaryAbortRef.current.signal
+    );
+
+    if (piiDetected) {
+      setNotes((n) => [...n, "PII detected and redacted (best-effort) before processing."]);
+    }
+
+    // API call
+    const resp = await apiPost<unknown>(
+      "/diary/summarize",
+      {
+        diary: payloadDiary,
+        enforceRedaction: enforcePhiGate,
+        redactOutput,
+        windowDays,
+      },
+      summaryAbortRef.current.signal
+    );
+
+    const parsed = SummaryResponseSchema.safeParse(resp);
+    if (!parsed.success) throw new Error("Bad summary response");
+
+    const normalized = normalizeSummaryFromApi(parsed.data);
+
+    setSummary(normalized.summary);
+    setTrust(normalized.trust);
+    setSummaryGeneratedAt(normalized.meta.generatedAt);
+
+    if (normalized.meta.piiDetected) {
+      setNotes((n) => [
+        ...n,
+        normalized.meta.redacted
+          ? "PII detected in model output and redacted (best-effort)."
+          : "PII detected in model output.",
+      ]);
+    }
 
     try {
-      if (enforcePhiGate && redactionMode === "none") {
-        const anyPii = diary.some((e) => detectLikelyPii(e.notes));
-        if (anyPii) {
-          explainPiiGateFailure();
-          return;
-        }
-      }
-
-      const { diary: payloadDiary, piiDetected } = await prepareDiaryForApi(
-        diary,
-        redactionMode,
-        summaryAbortRef.current.signal
+      localStorage.setItem(
+        LS_KEYS.preVisitSummary,
+        JSON.stringify(summaryToStoragePayload(normalized.summary, normalized.trust))
       );
-      if (piiDetected) setNotes((n) => [...n, "PII detected and redacted (best-effort) before processing."]);
-
-      const resp = await apiPost<unknown>(
-        "/diary/summarize",
-        {
-          diary: payloadDiary,
-          // backend can ignore these (forward compatible)
-          enforceRedaction: enforcePhiGate,
-          redactOutput: redactOutput,
-          windowDays,
-        },
-        summaryAbortRef.current.signal
-      );
-
-      const parsed = SummaryResponseSchema.safeParse(resp);
-      if (!parsed.success) throw new Error("Bad summary response");
-
-      const normalized = normalizeSummaryFromApi(parsed.data);
-
-      setSummary(normalized.summary);
-      setTrust(normalized.trust);
-      setSummaryGeneratedAt(normalized.meta.generatedAt);
-
-      if (normalized.meta.piiDetected) {
-        setNotes((n) => [
-          ...n,
-          normalized.meta.redacted
-            ? "PII detected in model output and redacted (best-effort)."
-            : "PII detected in model output.",
-        ]);
-      }
-
-      try {
-        localStorage.setItem(
-          LS_KEYS.preVisitSummary,
-          JSON.stringify(summaryToStoragePayload(normalized.summary, normalized.trust))
-        );
-      } catch {
-        // ignore
-      }
-      return;
-    } catch (e) {
-      if ((e as any)?.name === "AbortError") return;
-
-      const errObj = e as ApiError;
-      const code = errObj?.payload?.code ? String(errObj.payload.code) : "";
-      if (code === "PII_DETECTED") {
-        explainPiiGateFailure();
-      } else {
-        // fall back to local heuristic summary
-        const last7 = lastNDays(diary, 7);
-        const avgSym = avg(last7.map((x) => x.symptomScore));
-        const worst = last7.reduce(
-          (acc, x) => (!acc || x.symptomScore > acc.symptomScore ? x : acc),
-          null as DiaryEntry | null
-        );
-
-        const tagStats = extractTagStats(last7);
-        const triggers = Array.from(tagStats.entries())
-          .filter(([, v]) => v.count >= 2)
-          .sort((a, b) => b[1].avgSymptom - a[1].avgSymptom)
-          .slice(0, 4)
-          .map(([k]) => k);
-
-        const localSummary: DiarySummary = {
-          headline: diary.length ? "Pre-visit summary (local fallback)" : "Add a few diary entries to generate a summary",
-          bullets: diary.length
-            ? [
-              {
-                text:
-                  avgSym != null
-                    ? `Last 7 days avg symptom score: ${avgSym.toFixed(1)} / 10`
-                    : "Not enough data for a 7-day average",
-                verified: null,
-                evidence: [],
-              },
-              {
-                text: worst
-                  ? `Worst day (last 7 days): ${worst.date} (symptom ${worst.symptomScore}/10)`
-                  : "No worst day available",
-                verified: null,
-                evidence: [],
-              },
-              { text: "Patterns are hints only (not a diagnosis).", verified: null, evidence: [] },
-            ]
-            : [],
-          possibleTriggers: triggers.map((t) => ({ text: t, verified: null, evidence: [] })),
-          gentleSuggestions: diary.length
-            ? [
-              { text: "Keep logging meals/sleep alongside symptoms for clearer patterns.", verified: null, evidence: [] },
-              {
-                text: "If symptoms worsen or new red flags appear, consider contacting a clinician.",
-                verified: null,
-                evidence: [],
-              },
-            ]
-            : [],
-          questionsForVisit: diary.length
-            ? [
-              "When did symptoms start, and what seems to worsen/improve them?",
-              "Any recent diet/med changes, stress, travel, or illness exposures?",
-              "Any new red flags (fever, severe pain, dehydration, blood)?",
-            ]
-            : [],
-          redFlags: [],
-          last7DaysAvgSymptom: avgSym,
-        };
-
-        const localTrust = computeTrust(localSummary);
-
-        setSummary(localSummary);
-        setTrust(localTrust);
-        setSummaryGeneratedAt(Date.now());
-
-        try {
-          localStorage.setItem(
-            LS_KEYS.preVisitSummary,
-            JSON.stringify(summaryToStoragePayload(localSummary, localTrust))
-          );
-        } catch {
-          // ignore
-        }
-
-        setNotes((n) => [...n, "API unavailable — summary generated locally (demo fallback)."]);
-      }
-    } finally {
-      setBusy((b) => ({ ...b, summary: false }));
+    } catch {
+      // ignore
     }
-  }, [diary, enforcePhiGate, explainPiiGateFailure, redactOutput, redactionMode, windowDays]);
+  } catch (e: unknown) {
+    // Abort legyen néma, kivéve ha timeout miatt abortoltunk
+    if ((e as any)?.name === "AbortError" && !didTimeout) return;
+
+    const errObj = e as ApiError;
+    const code = errObj?.payload?.code ? String(errObj.payload.code) : "";
+
+    if (code === "PII_DETECTED") {
+      explainPiiGateFailure();
+      return;
+    }
+
+    if (didTimeout) {
+      setNotes((n) => [...n, "Summary API timed out — using local fallback."]);
+    }
+
+    // ---- LOCAL FALLBACK ----
+    const last7 = lastNDays(diary, 7);
+    const avgSym = avg(last7.map((x) => x.symptomScore));
+    const worst = last7.reduce(
+      (acc, x) => (!acc || x.symptomScore > acc.symptomScore ? x : acc),
+      null as DiaryEntry | null
+    );
+
+    const tagStats = extractTagStats(last7);
+    const triggers = Array.from(tagStats.entries())
+      .filter(([, v]) => v.count >= 2)
+      .sort((a, b) => b[1].avgSymptom - a[1].avgSymptom)
+      .slice(0, 4)
+      .map(([k]) => k);
+
+    const localSummary: DiarySummary = {
+      headline: diary.length
+        ? "Pre-visit summary (local fallback)"
+        : "Add a few diary entries to generate a summary",
+      bullets: diary.length
+        ? [
+            {
+              text:
+                avgSym != null
+                  ? `Last 7 days avg symptom score: ${avgSym.toFixed(1)} / 10`
+                  : "Not enough data for a 7-day average",
+              verified: null,
+              evidence: [],
+            },
+            {
+              text: worst
+                ? `Worst day (last 7 days): ${worst.date} (symptom ${worst.symptomScore}/10)`
+                : "No worst day available",
+              verified: null,
+              evidence: [],
+            },
+            { text: "Patterns are hints only (not a diagnosis).", verified: null, evidence: [] },
+          ]
+        : [],
+      possibleTriggers: triggers.map((t) => ({ text: t, verified: null, evidence: [] })),
+      gentleSuggestions: diary.length
+        ? [
+            {
+              text: "Keep logging meals/sleep alongside symptoms for clearer patterns.",
+              verified: null,
+              evidence: [],
+            },
+            {
+              text: "If symptoms worsen or new red flags appear, consider contacting a clinician.",
+              verified: null,
+              evidence: [],
+            },
+          ]
+        : [],
+      questionsForVisit: diary.length
+        ? [
+            "When did symptoms start, and what seems to worsen/improve them?",
+            "Any recent diet/med changes, stress, travel, or illness exposures?",
+            "Any new red flags (fever, severe pain, dehydration, blood)?",
+          ]
+        : [],
+      redFlags: [],
+      last7DaysAvgSymptom: avgSym,
+    };
+
+    const localTrust = computeTrust(localSummary);
+
+    setSummary(localSummary);
+    setTrust(localTrust);
+    setSummaryGeneratedAt(Date.now());
+
+    try {
+      localStorage.setItem(
+        LS_KEYS.preVisitSummary,
+        JSON.stringify(summaryToStoragePayload(localSummary, localTrust))
+      );
+    } catch {
+      // ignore
+    }
+
+    if (!didTimeout) {
+      setNotes((n) => [...n, "API unavailable — summary generated locally (demo fallback)."]);
+    }
+  } finally {
+    window.clearTimeout(timeoutId);
+    setBusy((b) => ({ ...b, summary: false }));
+  }
+}, [diary, enforcePhiGate, explainPiiGateFailure, redactOutput, redactionMode, windowDays]);
 
   const transcribeDiaryAudioIntoNotes = useCallback(async () => {
     setErr(null);
