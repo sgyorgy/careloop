@@ -604,8 +604,17 @@ function PatientPageContent() {
   // WOW: 3D Body Map
   const [showBodyMap, setShowBodyMap] = useState(false);
 
-  // WOW: Predictive Insights
-  const [predictiveInsights, setPredictiveInsights] = useState<string | null>(null);
+  /// WOW: Predictive Insights
+  type PredictiveInsight = {
+    type?: string;
+    title: string;
+    description: string;
+    confidence?: "high" | "medium" | "low" | string | number;
+    icon?: string;
+  };
+  
+  const [predictiveInsights, setPredictiveInsights] =
+    useState<string | PredictiveInsight[] | null>(null);
 
   // WOW: AR Scanner
   const [showScanner, setShowScanner] = useState(false);
@@ -1121,21 +1130,33 @@ function PatientPageContent() {
   }, [audioFile]);
 
   const fetchPredictiveInsights = useCallback(async () => {
+    // ne induljon el párhuzamosan
+    if (busy.insights) return;
+  
+    setErr(null);
+    setNotes([]);
+  
     if (diary.length < 3) {
       setErr("Need at least 3 diary entries for predictive insights.");
       return;
     }
-    setBusy(b => ({ ...b, insights: true }));
+  
+    setBusy((b) => ({ ...b, insights: true }));
     setPredictiveInsights(null);
+  
     try {
       const resp = await apiPost<any>("/diary/insights", { diary });
-      setPredictiveInsights(resp.insights ?? []);
-    } catch {
+      const raw = resp?.insights ?? resp;
+  
+      if (Array.isArray(raw)) setPredictiveInsights(raw);
+      else if (typeof raw === "string") setPredictiveInsights(raw);
+      else setPredictiveInsights(raw ? JSON.stringify(raw, null, 2) : null);
+    } catch (e) {
       setErr("Failed to fetch predictive insights.");
     } finally {
-      setBusy(b => ({ ...b, insights: false }));
+      setBusy((b) => ({ ...b, insights: false }));
     }
-  }, [diary]);
+  }, [diary, busy.insights, setNotes]);
 
   const simulateARScanner = useCallback(async () => {
     setShowScanner(true);
@@ -1606,90 +1627,132 @@ function PatientPageContent() {
                     </div>
                   </div>
 
-                  <div className="flex flex-wrap gap-2">
+                 <div className="flex flex-wrap gap-2">
                     <button
                       disabled={!canAnalyze || busy.trends}
                       onClick={refreshTrends}
-                      className={`rounded-xl px-4 py-2 text-sm font-medium ${!canAnalyze || busy.trends
-                        ? "cursor-not-allowed bg-slate-100 text-slate-400"
-                        : "bg-slate-900 text-white hover:bg-slate-800"
-                        }`}
+                      className={`rounded-xl px-4 py-2 text-sm font-medium ${
+                        !canAnalyze || busy.trends
+                          ? "cursor-not-allowed bg-slate-100 text-slate-400"
+                          : "bg-slate-900 text-white hover:bg-slate-800"
+                      }`}
                     >
                       {busy.trends ? "Refreshing…" : "Refresh trends"}
                     </button>
-
+                  
                     <button
                       disabled={!canAnalyze || busy.summary}
                       onClick={generateSummary}
-                      className={`rounded-xl px-4 py-2 text-sm font-medium ${!canAnalyze || busy.summary
-                        ? "cursor-not-allowed bg-slate-100 text-slate-400"
-                        : "border border-slate-200 bg-white text-slate-900 hover:bg-slate-50"
-                        }`}
+                      className={`rounded-xl px-4 py-2 text-sm font-medium ${
+                        !canAnalyze || busy.summary
+                          ? "cursor-not-allowed bg-slate-100 text-slate-400"
+                          : "border border-slate-200 bg-white text-slate-900 hover:bg-slate-50"
+                      }`}
                     >
                       {busy.summary ? "Generating…" : "Generate summary"}
                     </button>
-
+                  
                     <button
                       disabled={diary.length < 3 || busy.insights}
                       onClick={fetchPredictiveInsights}
-                      className={`rounded-xl border px-4 py-2 text-sm font-medium ${diary.length < 3 || busy.insights
-                        ? "cursor-not-allowed border-slate-200 bg-slate-50 text-slate-400"
-                        : "border-indigo-200 bg-indigo-50 text-indigo-900 hover:bg-indigo-100"
-                        }`}
+                      className={`rounded-xl border px-4 py-2 text-sm font-medium ${
+                        diary.length < 3 || busy.insights
+                          ? "cursor-not-allowed border-slate-200 bg-slate-50 text-slate-400"
+                          : "border-indigo-200 bg-indigo-50 text-indigo-900 hover:bg-indigo-100"
+                      }`}
                     >
                       {busy.insights ? "Analyzing…" : "✨ Predictive Insights"}
                     </button>
                   </div>
-                </div>
-
-                {predictiveInsights && (
-                  <div className="mt-4 rounded-xl border border-indigo-200 bg-indigo-50 px-4 py-3 text-sm text-indigo-900 shadow-inner">
-                    <div className="flex items-center gap-2 font-semibold">
-                      <span>✨</span> AI Predictive Insights
+                  </div>
+                  
+                  {predictiveInsights != null && (
+                    <div className="mt-4 rounded-xl border border-indigo-200 bg-indigo-50 px-4 py-3 text-sm text-indigo-900 shadow-inner">
+                      <div className="flex items-center gap-2 font-semibold">
+                        <span>✨</span> AI Predictive Insights
+                      </div>
+                  
+                      {typeof predictiveInsights === "string" ? (
+                        <div className="mt-1 whitespace-pre-wrap">
+                          {predictiveInsights.trim() ? predictiveInsights : "No predictive insights available yet."}
+                        </div>
+                      ) : Array.isArray(predictiveInsights) ? (
+                        predictiveInsights.length ? (
+                          <div className="mt-3 space-y-3">
+                            {predictiveInsights.map((ins: any, i: number) => (
+                              <div
+                                key={`${ins?.title ?? "ins"}-${i}`}
+                                className="flex items-start gap-3 rounded-xl bg-white/60 p-3"
+                              >
+                                <span className="text-2xl">{ins?.icon ?? "✨"}</span>
+                                <div>
+                                  <div className="text-sm font-semibold text-slate-900">
+                                    {ins?.title ?? "Insight"}
+                                  </div>
+                                  <div className="mt-0.5 text-xs text-slate-700">
+                                    {ins?.description ?? ""}
+                                  </div>
+                                  {ins?.confidence != null && (
+                                    <span className="mt-1 inline-block rounded-full bg-white px-2 py-0.5 text-[10px] font-medium text-slate-700">
+                                      {String(ins.confidence)} confidence
+                                    </span>
+                                  )}
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        ) : (
+                          <div className="mt-1 text-slate-700">No predictive insights returned.</div>
+                        )
+                      ) : (
+                        <pre className="mt-2 text-xs whitespace-pre-wrap text-slate-700">
+                          {JSON.stringify(predictiveInsights, null, 2)}
+                        </pre>
+                      )}
                     </div>
-                    <div className="mt-1 whitespace-pre-wrap">{predictiveInsights}</div>
-                  </div>
-                )}
-
-                <p className="mt-2 text-sm text-slate-700">
-                  {canAnalyze ? "Visualize symptoms, sleep, mood — optional sentiment (demo) — over time." : "Add at least 2 entries to see trends."}
-                </p>
-
-                {insights.redFlag ? (
-                  <div className="mt-4 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
-                    Pattern flag (demo): symptoms appear significantly worse recently. Consider discussing with a clinician.
-                  </div>
-                ) : null}
-
-                <div className="mt-5 w-full" style={{ height: 320 }}>
-                  <ResponsiveContainer width="100%" height="100%">
-                    <LineChart data={windowedTrend}>
-                      <CartesianGrid strokeDasharray="3 3" />
-                      <XAxis dataKey="date" tickMargin={8} />
-                      <YAxis yAxisId="left" tickMargin={8} />
-                      {showSentiment && hasAnySentiment ? (
-                        <YAxis yAxisId="right" orientation="right" domain={[-1, 1]} tickMargin={8} />
-                      ) : null}
-                      <Tooltip
-                        formatter={(value: any, name: any) => {
-                          if (name === "Sentiment (-1..1)") return [Number(value).toFixed(2), name];
-                          if (typeof value === "number") return [value.toFixed(1), name];
-                          return [String(value), name];
-                        }}
-                      />
-                      <Legend />
-                      <Line yAxisId="left" type="monotone" dataKey="symptomScore" name="Symptom (0-10)" dot={false} />
-                      <Line yAxisId="left" type="monotone" dataKey="sleepHours" name="Sleep (hours)" dot={false} />
-                      <Line yAxisId="left" type="monotone" dataKey="moodScore" name="Mood (0-10)" dot={false} />
-                      {showSentiment && hasAnySentiment ? (
-                        <Line
-                          yAxisId="right"
-                          type="monotone"
-                          dataKey="sentimentScore"
-                          name="Sentiment (-1..1)"
-                          dot={false}
+                  )}
+                  
+                  <p className="mt-2 text-sm text-slate-700">
+                    {canAnalyze
+                      ? "Visualize symptoms, sleep, mood — optional sentiment (demo) — over time."
+                      : "Add at least 2 entries to see trends."}
+                  </p>
+                  
+                  {insights.redFlag ? (
+                    <div className="mt-4 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+                      Pattern flag (demo): symptoms appear significantly worse recently. Consider discussing with a clinician.
+                    </div>
+                  ) : null}
+  
+                  <div className="mt-5 w-full" style={{ height: 320 }}>
+                    <ResponsiveContainer width="100%" height="100%">
+                      <LineChart data={windowedTrend}>
+                        <CartesianGrid strokeDasharray="3 3" />
+                        <XAxis dataKey="date" tickMargin={8} />
+                        <YAxis yAxisId="left" tickMargin={8} />
+                        {showSentiment && hasAnySentiment ? (
+                          <YAxis yAxisId="right" orientation="right" domain={[-1, 1]} tickMargin={8} />
+                        ) : null}
+                        <Tooltip
+                          formatter={(value: any, name: any) => {
+                            if (name === "Sentiment (-1..1)") return [Number(value).toFixed(2), name];
+                            if (typeof value === "number") return [value.toFixed(1), name];
+                            return [String(value), name];
+                          }}
                         />
-                      ) : null}
+                        <Legend />
+                        <Line yAxisId="left" type="monotone" dataKey="symptomScore" name="Symptom (0-10)" dot={false} />
+                        <Line yAxisId="left" type="monotone" dataKey="sleepHours" name="Sleep (hours)" dot={false} />
+                        <Line yAxisId="left" type="monotone" dataKey="moodScore" name="Mood (0-10)" dot={false} />
+                        {showSentiment && hasAnySentiment ? (
+                          <Line
+                            yAxisId="right"
+                            type="monotone"
+                            dataKey="sentimentScore"
+                            name="Sentiment (-1..1)"
+                            dot={false}
+                          />
+                        ) : null}
                     </LineChart>
                   </ResponsiveContainer>
                 </div>
