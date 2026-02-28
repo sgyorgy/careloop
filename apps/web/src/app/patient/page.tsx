@@ -1656,7 +1656,7 @@ function PatientPageContent() {
 
                  <div className="flex flex-wrap gap-2">
                     <button
-                      disabled={!canTrend || busy.trends}
+                      disabled={!canAnalyze || busy.trends}
                       onClick={refreshTrends}
                       className={`rounded-xl px-4 py-2 text-sm font-medium ${
                         !canAnalyze || busy.trends
