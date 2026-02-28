@@ -1668,7 +1668,7 @@ function PatientPageContent() {
                     </button>
                   
                     <button
-                      disabled={!canSummarize || busy.summary}
+                      disabled={!canAnalyze || busy.summary}
                       onClick={generateSummary}
                       className={`rounded-xl px-4 py-2 text-sm font-medium ${
                         !canAnalyze || busy.summary
