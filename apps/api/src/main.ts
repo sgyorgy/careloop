@@ -1952,11 +1952,39 @@ app.post(
 
     const diary = normalizeDiary(parsed.data.diary);
 
-    const trend = diary.map((e) => ({
+    // alap trend mezők
+    const baseTrend = diary.map((e) => ({
       date: e.date,
       symptomScore: e.symptomScore,
       sleepHours: e.sleepHours,
       moodScore: e.moodScore,
+    }));
+
+    // sentiment input: notes + tags (nem logoljuk)
+    const texts = diary.map((e) => diaryEntryText(e));
+
+    // üres bejegyzéseket kihagyjuk (Azure TA nem szereti az üres stringet)
+    const idxMap: number[] = [];
+    const docs: string[] = [];
+    for (let i = 0; i < texts.length; i++) {
+      const t = (texts[i] ?? "").trim();
+      if (!t) continue;
+      idxMap.push(i);
+      docs.push(t);
+    }
+
+    const analyzed = docs.length ? await analyzeSentimentBatchBestEffort(docs) : [];
+    const sentiments: Array<Awaited<ReturnType<typeof analyzeSentimentBatchBestEffort>>[number]> = Array(
+      diary.length
+    ).fill(null);
+
+    for (let j = 0; j < idxMap.length; j++) {
+      sentiments[idxMap[j]] = analyzed[j] ?? null;
+    }
+
+    const trend = baseTrend.map((row, i) => ({
+      ...row,
+      sentiment: sentiments[i], // {label,scores,compound} | null
     }));
 
     // no content logging
