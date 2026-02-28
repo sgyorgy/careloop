@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { z } from "zod";
@@ -203,9 +203,9 @@ function normalizeDiary(entries: DiaryEntry[]): DiaryEntry[] {
       notes: String((e as any).notes ?? "").slice(0, 4000),
       tags: Array.isArray((e as any).tags)
         ? (e as any).tags
-            .map((t: any) => String(t).trim())
-            .filter(Boolean)
-            .slice(0, 12)
+          .map((t: any) => String(t).trim())
+          .filter(Boolean)
+          .slice(0, 12)
         : [],
     }))
     .sort((a, b) => a.date.localeCompare(b.date));
@@ -359,8 +359,8 @@ function computeInsights(diary: DiaryEntry[]) {
       ? d >= 1
         ? "worsening"
         : d <= -1
-        ? "improving"
-        : "stable"
+          ? "improving"
+          : "stable"
       : "insufficient-data";
 
   const worst = last7.reduce(
@@ -390,14 +390,14 @@ function normalizeSummaryItem(x: unknown): SummaryItem {
   const verified = typeof o?.verified === "boolean" ? o.verified : null;
   const evidence = Array.isArray(o?.evidence)
     ? o.evidence
-        .map((e: any) => ({
-          entryDate: typeof e?.entryDate === "string" ? e.entryDate.slice(0, 10) : undefined,
-          entryIndex: typeof e?.entryIndex === "number" ? e.entryIndex : undefined,
-          snippet: typeof e?.snippet === "string" ? e.snippet.slice(0, 240) : undefined,
-          tag: typeof e?.tag === "string" ? e.tag.slice(0, 40) : undefined,
-          score: typeof e?.score === "number" ? e.score : undefined,
-        }))
-        .filter((e: EvidenceRef) => !!(e.entryDate || e.entryIndex != null || e.tag || e.snippet))
+      .map((e: any) => ({
+        entryDate: typeof e?.entryDate === "string" ? e.entryDate.slice(0, 10) : undefined,
+        entryIndex: typeof e?.entryIndex === "number" ? e.entryIndex : undefined,
+        snippet: typeof e?.snippet === "string" ? e.snippet.slice(0, 240) : undefined,
+        tag: typeof e?.tag === "string" ? e.tag.slice(0, 40) : undefined,
+        score: typeof e?.score === "number" ? e.score : undefined,
+      }))
+      .filter((e: EvidenceRef) => !!(e.entryDate || e.entryIndex != null || e.tag || e.snippet))
     : [];
 
   return { text: text || "(missing text)", verified, evidence };
@@ -583,7 +583,7 @@ async function prepareDiaryForApi(diary: DiaryEntry[], mode: RedactionMode, sign
 }
 
 // ---------------- component ----------------
-export default function PatientPage() {
+function PatientPageContent() {
   const searchParams = useSearchParams();
   const tab = (searchParams.get("tab") || "diary") as "diary" | "tasks";
   const demo = searchParams.get("demo") === "1";
@@ -594,11 +594,47 @@ export default function PatientPage() {
   const [trust, setTrust] = useState<TrustReport | null>(null);
   const [summaryGeneratedAt, setSummaryGeneratedAt] = useState<number | null>(null);
 
+  // Voice diary (optional)
+  const [audioFile, setAudioFile] = useState<File | null>(null);
+  const [sttWarnings, setSttWarnings] = useState<string[]>([]);
+
+  // WOW: Vocal Biomarkers
+  const [biomarkerSummary, setBiomarkerSummary] = useState<string | null>(null);
+
+  // WOW: 3D Body Map
+  const [showBodyMap, setShowBodyMap] = useState(false);
+
+  // WOW: Predictive Insights
+  const [predictiveInsights, setPredictiveInsights] = useState<string | null>(null);
+
+  // WOW: AR Scanner
+  const [showScanner, setShowScanner] = useState(false);
+  const [scannerResult, setScannerResult] = useState<string | null>(null);
+
+  // Sentiment UI (optional)
+  const [showSentiment, setShowSentiment] = useState<boolean>(false);
+
+  // WOW: Health Twin
+  const [healthTwin, setHealthTwin] = useState<any>(null);
+  // WOW: Correlations
+  const [correlations, setCorrelations] = useState<any>(null);
+  // WOW: Alerts
+  const [alerts, setAlerts] = useState<any[]>([]);
+  // WOW: Streaks / Gamification
+  const [streaks, setStreaks] = useState<any>(null);
+
   const [busy, setBusy] = useState({
     trends: false,
     summary: false,
     transcribe: false,
     redact: false,
+    biomarkers: false,
+    insights: false,
+    scanning: false,
+    healthTwin: false,
+    correlations: false,
+    alerts: false,
+    streaks: false,
   });
 
   const [err, setErr] = useState<string | null>(null);
@@ -612,12 +648,7 @@ export default function PatientPage() {
   const [redactOutput, setRedactOutput] = useState<boolean>(true); // allow API to auto-redact output + flag
   const [expandedEvidence, setExpandedEvidence] = useState<Record<string, boolean>>({});
 
-  // Voice diary (optional)
-  const [audioFile, setAudioFile] = useState<File | null>(null);
-  const [sttWarnings, setSttWarnings] = useState<string[]>([]);
 
-  // Sentiment UI (optional)
-  const [showSentiment, setShowSentiment] = useState<boolean>(false);
 
   // Entry form
   const [form, setForm] = useState<DiaryEntry>({
@@ -960,41 +991,41 @@ export default function PatientPage() {
           headline: diary.length ? "Pre-visit summary (local fallback)" : "Add a few diary entries to generate a summary",
           bullets: diary.length
             ? [
-                {
-                  text:
-                    avgSym != null
-                      ? `Last 7 days avg symptom score: ${avgSym.toFixed(1)} / 10`
-                      : "Not enough data for a 7-day average",
-                  verified: null,
-                  evidence: [],
-                },
-                {
-                  text: worst
-                    ? `Worst day (last 7 days): ${worst.date} (symptom ${worst.symptomScore}/10)`
-                    : "No worst day available",
-                  verified: null,
-                  evidence: [],
-                },
-                { text: "Patterns are hints only (not a diagnosis).", verified: null, evidence: [] },
-              ]
+              {
+                text:
+                  avgSym != null
+                    ? `Last 7 days avg symptom score: ${avgSym.toFixed(1)} / 10`
+                    : "Not enough data for a 7-day average",
+                verified: null,
+                evidence: [],
+              },
+              {
+                text: worst
+                  ? `Worst day (last 7 days): ${worst.date} (symptom ${worst.symptomScore}/10)`
+                  : "No worst day available",
+                verified: null,
+                evidence: [],
+              },
+              { text: "Patterns are hints only (not a diagnosis).", verified: null, evidence: [] },
+            ]
             : [],
           possibleTriggers: triggers.map((t) => ({ text: t, verified: null, evidence: [] })),
           gentleSuggestions: diary.length
             ? [
-                { text: "Keep logging meals/sleep alongside symptoms for clearer patterns.", verified: null, evidence: [] },
-                {
-                  text: "If symptoms worsen or new red flags appear, consider contacting a clinician.",
-                  verified: null,
-                  evidence: [],
-                },
-              ]
+              { text: "Keep logging meals/sleep alongside symptoms for clearer patterns.", verified: null, evidence: [] },
+              {
+                text: "If symptoms worsen or new red flags appear, consider contacting a clinician.",
+                verified: null,
+                evidence: [],
+              },
+            ]
             : [],
           questionsForVisit: diary.length
             ? [
-                "When did symptoms start, and what seems to worsen/improve them?",
-                "Any recent diet/med changes, stress, travel, or illness exposures?",
-                "Any new red flags (fever, severe pain, dehydration, blood)?",
-              ]
+              "When did symptoms start, and what seems to worsen/improve them?",
+              "Any recent diet/med changes, stress, travel, or illness exposures?",
+              "Any new red flags (fever, severe pain, dehydration, blood)?",
+            ]
             : [],
           redFlags: [],
           last7DaysAvgSymptom: avgSym,
@@ -1065,6 +1096,133 @@ export default function PatientPage() {
       setBusy((b) => ({ ...b, transcribe: false }));
     }
   }, [audioFile]);
+
+  const analyzeVocalBiomarkers = useCallback(async () => {
+    if (!audioFile) {
+      setErr("Choose an audio file first.");
+      return;
+    }
+    setBusy(b => ({ ...b, biomarkers: true }));
+    setBiomarkerSummary(null);
+    try {
+      const formData = new FormData();
+      formData.append("audio", audioFile);
+      const resp = await apiPostForm<any>("/diary/biomarkers", formData);
+      setBiomarkerSummary(resp.biomarkerSummary);
+      setForm(f => ({
+        ...f,
+        tags: Array.from(new Set([...(f.tags ?? []), "biomarker-verified"])).slice(0, 12),
+      }));
+    } catch {
+      setErr("Failed to analyze biomarkers.");
+    } finally {
+      setBusy(b => ({ ...b, biomarkers: false }));
+    }
+  }, [audioFile]);
+
+  const fetchPredictiveInsights = useCallback(async () => {
+    if (diary.length < 3) {
+      setErr("Need at least 3 diary entries for predictive insights.");
+      return;
+    }
+    setBusy(b => ({ ...b, insights: true }));
+    setPredictiveInsights(null);
+    try {
+      const resp = await apiPost<any>("/diary/insights", { diary });
+      setPredictiveInsights(resp.insights ?? []);
+    } catch {
+      setErr("Failed to fetch predictive insights.");
+    } finally {
+      setBusy(b => ({ ...b, insights: false }));
+    }
+  }, [diary]);
+
+  const simulateARScanner = useCallback(async () => {
+    setShowScanner(true);
+    setScannerResult(null);
+    setBusy(b => ({ ...b, scanning: true }));
+    try {
+      // Simulate fake camera delay
+      await new Promise(r => setTimeout(r, 2000));
+      // Call mock endpoint
+      const formData = new FormData();
+      const mockBlob = new Blob(["fake image"], { type: "image/jpeg" });
+      formData.append("image", mockBlob, "scan.jpg");
+      const resp = await apiPostForm<any>("/vision/scan", formData);
+
+      setScannerResult(`Identified: ${resp.identifiedItems?.join(", ") || "Unknown"}\nNutrition/Info: ${resp.nutritionOrInfo}`);
+
+      setForm(f => ({
+        ...f,
+        notes: f.notes ? `${f.notes}\n[Scanned] ${resp.identifiedItems?.join(", ")}` : `[Scanned] ${resp.identifiedItems?.join(", ")}`,
+        tags: Array.from(new Set([...(f.tags ?? []), "scanned-item"])).slice(0, 12)
+      }));
+    } catch {
+      setScannerResult("Scan failed. Ensure backend AR endpoint is mock-enabled.");
+    } finally {
+      setBusy(b => ({ ...b, scanning: false }));
+      setTimeout(() => setShowScanner(false), 4000);
+    }
+  }, []);
+
+  const handleBodyMapClick = useCallback((part: string) => {
+    const noteAdd = `Pain located in ${part}.`;
+    setForm(f => ({ ...f, notes: f.notes ? `${f.notes} ${noteAdd}` : noteAdd }));
+  }, []);
+
+  // WOW: Fetch Health Twin
+  const fetchHealthTwin = useCallback(async () => {
+    if (diary.length < 2) return;
+    setBusy(b => ({ ...b, healthTwin: true }));
+    try {
+      const resp = await apiPost<any>("/patient/health-twin", { diary });
+      setHealthTwin(resp);
+    } catch { /* fallback */ }
+    finally { setBusy(b => ({ ...b, healthTwin: false })); }
+  }, [diary]);
+
+  // WOW: Fetch Correlations
+  const fetchCorrelations = useCallback(async () => {
+    if (diary.length < 3) return;
+    setBusy(b => ({ ...b, correlations: true }));
+    try {
+      const resp = await apiPost<any>("/diary/correlations", { diary });
+      setCorrelations(resp);
+    } catch { /* fallback */ }
+    finally { setBusy(b => ({ ...b, correlations: false })); }
+  }, [diary]);
+
+  // WOW: Fetch Alerts
+  const fetchAlerts = useCallback(async () => {
+    if (diary.length < 2) return;
+    try {
+      const resp = await apiPost<any>("/diary/alerts", { diary });
+      setAlerts(resp.alerts ?? []);
+    } catch { /* ignore */ }
+  }, [diary]);
+
+  // WOW: Fetch Streaks
+  const fetchStreaks = useCallback(async () => {
+    if (diary.length < 1) return;
+    setBusy(b => ({ ...b, streaks: true }));
+    try {
+      const resp = await apiPost<any>("/patient/streaks", { diary });
+      setStreaks(resp);
+    } catch { /* ignore */ }
+    finally { setBusy(b => ({ ...b, streaks: false })); }
+  }, [diary]);
+
+  // Auto-fetch WOW data when diary changes
+  useEffect(() => {
+    if (diary.length >= 2) {
+      fetchHealthTwin();
+      fetchAlerts();
+      fetchStreaks();
+    }
+    if (diary.length >= 3) {
+      fetchCorrelations();
+    }
+  }, [diary.length]);
 
   const toggleTaskDone = useCallback((taskId: string) => {
     try {
@@ -1232,17 +1390,15 @@ export default function PatientPage() {
           <div className="inline-flex rounded-xl border border-slate-200 bg-white p-1 shadow-sm">
             <Link
               href="/patient"
-              className={`rounded-lg px-3 py-1.5 text-sm font-medium ${
-                tab === "diary" ? "bg-slate-900 text-white" : "text-slate-800 hover:bg-slate-50"
-              }`}
+              className={`rounded-lg px-3 py-1.5 text-sm font-medium ${tab === "diary" ? "bg-slate-900 text-white" : "text-slate-800 hover:bg-slate-50"
+                }`}
             >
               Diary
             </Link>
             <Link
               href="/patient?tab=tasks"
-              className={`rounded-lg px-3 py-1.5 text-sm font-medium ${
-                tab === "tasks" ? "bg-slate-900 text-white" : "text-slate-800 hover:bg-slate-50"
-              }`}
+              className={`rounded-lg px-3 py-1.5 text-sm font-medium ${tab === "tasks" ? "bg-slate-900 text-white" : "text-slate-800 hover:bg-slate-50"
+                }`}
             >
               Tasks
             </Link>
@@ -1435,17 +1591,15 @@ export default function PatientPage() {
                     <div className="inline-flex rounded-xl border border-slate-200 bg-white p-1 shadow-sm">
                       <button
                         onClick={() => setWindowDays(7)}
-                        className={`rounded-lg px-3 py-1.5 text-sm font-medium ${
-                          windowDays === 7 ? "bg-slate-900 text-white" : "text-slate-800 hover:bg-slate-50"
-                        }`}
+                        className={`rounded-lg px-3 py-1.5 text-sm font-medium ${windowDays === 7 ? "bg-slate-900 text-white" : "text-slate-800 hover:bg-slate-50"
+                          }`}
                       >
                         7d
                       </button>
                       <button
                         onClick={() => setWindowDays(30)}
-                        className={`rounded-lg px-3 py-1.5 text-sm font-medium ${
-                          windowDays === 30 ? "bg-slate-900 text-white" : "text-slate-800 hover:bg-slate-50"
-                        }`}
+                        className={`rounded-lg px-3 py-1.5 text-sm font-medium ${windowDays === 30 ? "bg-slate-900 text-white" : "text-slate-800 hover:bg-slate-50"
+                          }`}
                       >
                         30d
                       </button>
@@ -1456,11 +1610,10 @@ export default function PatientPage() {
                     <button
                       disabled={!canAnalyze || busy.trends}
                       onClick={refreshTrends}
-                      className={`rounded-xl px-4 py-2 text-sm font-medium ${
-                        !canAnalyze || busy.trends
-                          ? "cursor-not-allowed bg-slate-100 text-slate-400"
-                          : "bg-slate-900 text-white hover:bg-slate-800"
-                      }`}
+                      className={`rounded-xl px-4 py-2 text-sm font-medium ${!canAnalyze || busy.trends
+                        ? "cursor-not-allowed bg-slate-100 text-slate-400"
+                        : "bg-slate-900 text-white hover:bg-slate-800"
+                        }`}
                     >
                       {busy.trends ? "Refreshing…" : "Refresh trends"}
                     </button>
@@ -1468,16 +1621,35 @@ export default function PatientPage() {
                     <button
                       disabled={!canAnalyze || busy.summary}
                       onClick={generateSummary}
-                      className={`rounded-xl px-4 py-2 text-sm font-medium ${
-                        !canAnalyze || busy.summary
-                          ? "cursor-not-allowed bg-slate-100 text-slate-400"
-                          : "border border-slate-200 bg-white text-slate-900 hover:bg-slate-50"
-                      }`}
+                      className={`rounded-xl px-4 py-2 text-sm font-medium ${!canAnalyze || busy.summary
+                        ? "cursor-not-allowed bg-slate-100 text-slate-400"
+                        : "border border-slate-200 bg-white text-slate-900 hover:bg-slate-50"
+                        }`}
                     >
                       {busy.summary ? "Generating…" : "Generate summary"}
                     </button>
+
+                    <button
+                      disabled={diary.length < 3 || busy.insights}
+                      onClick={fetchPredictiveInsights}
+                      className={`rounded-xl border px-4 py-2 text-sm font-medium ${diary.length < 3 || busy.insights
+                        ? "cursor-not-allowed border-slate-200 bg-slate-50 text-slate-400"
+                        : "border-indigo-200 bg-indigo-50 text-indigo-900 hover:bg-indigo-100"
+                        }`}
+                    >
+                      {busy.insights ? "Analyzing…" : "✨ Predictive Insights"}
+                    </button>
                   </div>
                 </div>
+
+                {predictiveInsights && (
+                  <div className="mt-4 rounded-xl border border-indigo-200 bg-indigo-50 px-4 py-3 text-sm text-indigo-900 shadow-inner">
+                    <div className="flex items-center gap-2 font-semibold">
+                      <span>✨</span> AI Predictive Insights
+                    </div>
+                    <div className="mt-1 whitespace-pre-wrap">{predictiveInsights}</div>
+                  </div>
+                )}
 
                 <p className="mt-2 text-sm text-slate-700">
                   {canAnalyze ? "Visualize symptoms, sleep, mood — optional sentiment (demo) — over time." : "Add at least 2 entries to see trends."}
@@ -1623,8 +1795,8 @@ export default function PatientPage() {
                               b.verified === true || (b.verified == null && hasEvidence)
                                 ? "Verified"
                                 : b.verified === false
-                                ? "Unverified"
-                                : "No evidence";
+                                  ? "Unverified"
+                                  : "No evidence";
 
                             return (
                               <li key={key} className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2">
@@ -1693,8 +1865,8 @@ export default function PatientPage() {
                               t.verified === true || (t.verified == null && hasEvidence)
                                 ? "✓"
                                 : t.verified === false
-                                ? "?"
-                                : "•";
+                                  ? "?"
+                                  : "•";
                             return (
                               <span
                                 key={`tr_${i}_${stableId(t.text)}`}
@@ -1797,16 +1969,32 @@ export default function PatientPage() {
                       <button
                         onClick={transcribeDiaryAudioIntoNotes}
                         disabled={busy.transcribe || !audioFile}
-                        className={`rounded-xl px-4 py-2 text-sm font-medium ${
-                          busy.transcribe || !audioFile
-                            ? "cursor-not-allowed bg-slate-100 text-slate-400"
-                            : "bg-slate-900 text-white hover:bg-slate-800"
-                        }`}
+                        className={`rounded-xl px-4 py-2 text-sm font-medium ${busy.transcribe || !audioFile
+                          ? "cursor-not-allowed bg-slate-100 text-slate-400"
+                          : "bg-slate-900 text-white hover:bg-slate-800"
+                          }`}
                       >
                         {busy.transcribe ? "Transcribing…" : "Transcribe"}
                       </button>
+                      <button
+                        onClick={analyzeVocalBiomarkers}
+                        disabled={busy.biomarkers || !audioFile}
+                        className={`rounded-xl border px-4 py-2 text-sm font-medium ${busy.biomarkers || !audioFile
+                          ? "cursor-not-allowed bg-slate-50 text-slate-400 border-slate-200"
+                          : "border-rose-200 bg-rose-50 text-rose-900 hover:bg-rose-100"
+                          }`}
+                      >
+                        {busy.biomarkers ? "Analyzing…" : "🩺 Analyze Biomarkers"}
+                      </button>
                     </div>
                   </div>
+
+                  {biomarkerSummary && (
+                    <div className="mt-3 rounded-xl border border-rose-200 bg-white px-3 py-2 text-xs text-rose-800">
+                      <div className="font-semibold mb-1">Vocal Biomarker Analysis (Demo)</div>
+                      <div>{biomarkerSummary}</div>
+                    </div>
+                  )}
 
                   {sttWarnings.length ? (
                     <div className="mt-3 rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs text-slate-700">
@@ -1872,6 +2060,76 @@ export default function PatientPage() {
                     />
                   </label>
                 </div>
+
+                <div className="mt-5 flex flex-wrap gap-3 p-4 bg-slate-50 rounded-2xl border border-slate-200">
+                  <button
+                    onClick={() => setShowBodyMap(!showBodyMap)}
+                    className="flex-1 rounded-xl bg-white border border-slate-200 px-4 py-3 text-sm font-semibold text-slate-800 hover:bg-slate-50 flex items-center justify-center gap-2 shadow-sm"
+                  >
+                    🧍‍♂️ {showBodyMap ? "Hide Body Map" : "3D Body Map"}
+                  </button>
+                  <button
+                    onClick={simulateARScanner}
+                    disabled={busy.scanning}
+                    className="flex-1 rounded-xl bg-white border border-slate-200 px-4 py-3 text-sm font-semibold text-slate-800 hover:bg-slate-50 flex items-center justify-center gap-2 shadow-sm"
+                  >
+                    📸 {busy.scanning ? "Scanning..." : "AR Food/Med Scanner"}
+                  </button>
+                </div>
+
+                {showScanner && (
+                  <div className="mt-3 p-4 border border-emerald-200 bg-emerald-50 rounded-2xl flex flex-col items-center">
+                    <div className="w-full max-w-[240px] h-40 bg-slate-800 rounded-xl relative overflow-hidden flex items-center justify-center">
+                      <div className="absolute inset-0 bg-[url('data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI0MCIgaGVpZ2h0PSI0MCI+PHBhdGggZD0iTTAgMGg0MHY0MEgwem0yMCAyMGEyMCAyMCAwIDEgMCAwLTQwIDIwIDIwIDAgMCAwIDAgNDB6IiBmaWxsPSIjZmZmIiBmaWxsLW9wYWNpdHk9Ii4wNSIvPjwvc3ZnPg==')] opacity-30" />
+                      {!scannerResult ? (
+                        <div className="w-full h-1 bg-emerald-400 absolute top-1/2 -translate-y-1/2 shadow-[0_0_15px_#34d399] animate-[ping_1.5s_ease-in-out_infinite]" />
+                      ) : (
+                        <div className="text-emerald-400 text-3xl">✓</div>
+                      )}
+                    </div>
+                    {scannerResult && (
+                      <div className="mt-3 text-emerald-900 text-sm whitespace-pre-wrap text-center font-medium">
+                        {scannerResult}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {showBodyMap && (
+                  <div className="mt-3 p-4 border border-blue-200 bg-blue-50 rounded-2xl flex flex-col items-center">
+                    <div className="text-sm font-medium text-blue-900 mb-4">Click a body part to log a symptom</div>
+                    <svg viewBox="0 0 200 400" className="w-48 h-96 drop-shadow-md">
+                      <g className="cursor-pointer hover:opacity-80 transition-opacity" onClick={() => handleBodyMapClick("Head")}>
+                        <circle cx="100" cy="40" r="30" fill="#cbd5e1" className="hover:fill-blue-400" />
+                        <text x="100" y="45" textAnchor="middle" fontSize="10" fill="#334155" pointerEvents="none">Head</text>
+                      </g>
+                      <g className="cursor-pointer hover:opacity-80 transition-opacity" onClick={() => handleBodyMapClick("Right Arm")}>
+                        <rect x="20" y="80" width="30" height="120" rx="15" fill="#cbd5e1" className="hover:fill-blue-400" />
+                        <text x="35" y="140" textAnchor="middle" fontSize="10" fill="#334155" pointerEvents="none" transform="rotate(-90 35 140)">R. Arm</text>
+                      </g>
+                      <g className="cursor-pointer hover:opacity-80 transition-opacity" onClick={() => handleBodyMapClick("Chest")}>
+                        <rect x="60" y="80" width="80" height="70" rx="10" fill="#cbd5e1" className="hover:fill-blue-400" />
+                        <text x="100" y="120" textAnchor="middle" fontSize="10" fill="#334155" pointerEvents="none">Chest</text>
+                      </g>
+                      <g className="cursor-pointer hover:opacity-80 transition-opacity" onClick={() => handleBodyMapClick("Abdomen")}>
+                        <rect x="60" y="155" width="80" height="80" rx="10" fill="#cbd5e1" className="hover:fill-blue-400" />
+                        <text x="100" y="200" textAnchor="middle" fontSize="10" fill="#334155" pointerEvents="none">Abdomen</text>
+                      </g>
+                      <g className="cursor-pointer hover:opacity-80 transition-opacity" onClick={() => handleBodyMapClick("Left Arm")}>
+                        <rect x="150" y="80" width="30" height="120" rx="15" fill="#cbd5e1" className="hover:fill-blue-400" />
+                        <text x="165" y="140" textAnchor="middle" fontSize="10" fill="#334155" pointerEvents="none" transform="rotate(90 165 140)">L. Arm</text>
+                      </g>
+                      <g className="cursor-pointer hover:opacity-80 transition-opacity" onClick={() => handleBodyMapClick("Right Leg")}>
+                        <rect x="60" y="240" width="35" height="140" rx="17.5" fill="#cbd5e1" className="hover:fill-blue-400" />
+                        <text x="77.5" y="310" textAnchor="middle" fontSize="10" fill="#334155" pointerEvents="none" transform="rotate(-90 77.5 310)">R. Leg</text>
+                      </g>
+                      <g className="cursor-pointer hover:opacity-80 transition-opacity" onClick={() => handleBodyMapClick("Left Leg")}>
+                        <rect x="105" y="240" width="35" height="140" rx="17.5" fill="#cbd5e1" className="hover:fill-blue-400" />
+                        <text x="122.5" y="310" textAnchor="middle" fontSize="10" fill="#334155" pointerEvents="none" transform="rotate(90 122.5 310)">L. Leg</text>
+                      </g>
+                    </svg>
+                  </div>
+                )}
 
                 <label className="mt-4 block">
                   <span className="text-xs font-semibold text-slate-700">Notes (synthetic)</span>
@@ -2019,11 +2277,245 @@ export default function PatientPage() {
           </>
         )}
 
-        <footer className="mt-8 text-xs text-slate-500">
-          API calls go to <code className="rounded bg-slate-100 px-1">/api/*</code> (proxy via{" "}
-          <code className="rounded bg-slate-100 px-1">API_PROXY_TARGET</code>). For demos, keep inputs synthetic.
+        {/* ============== WOW FEATURES SECTION ============== */}
+        {tab === "diary" && diary.length >= 2 && (
+          <section className="mt-8 space-y-6 animate-fade-in-up">
+            {/* --- Proactive Alerts --- */}
+            {alerts.length > 0 && (
+              <div className="space-y-3">
+                {alerts.map((a: any, i: number) => (
+                  <div key={i} className={`rounded-2xl border p-4 shadow-sm flex items-start gap-3 ${a.level === "critical" ? "border-red-300 bg-red-50 dark:bg-red-950/30 dark:border-red-800" :
+                    a.level === "warning" ? "border-amber-300 bg-amber-50 dark:bg-amber-950/30 dark:border-amber-800" :
+                      "border-emerald-300 bg-emerald-50 dark:bg-emerald-950/30 dark:border-emerald-800"
+                    }`}>
+                    <span className="text-2xl">{a.icon}</span>
+                    <div>
+                      <div className="font-semibold text-sm text-slate-900 dark:text-white">{a.title}</div>
+                      <div className="text-xs text-slate-600 dark:text-slate-400 mt-0.5">{a.message}</div>
+                    </div>
+                    <span className={`ml-auto rounded-full px-2 py-0.5 text-[10px] font-bold uppercase ${a.level === "critical" ? "bg-red-200 text-red-800 dark:bg-red-800 dark:text-red-200" :
+                      a.level === "warning" ? "bg-amber-200 text-amber-800 dark:bg-amber-800 dark:text-amber-200" :
+                        "bg-emerald-200 text-emerald-800 dark:bg-emerald-800 dark:text-emerald-200"
+                      }`}>{a.level}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* --- AI Health Twin --- */}
+            {healthTwin && (
+              <div className="card-glass p-6">
+                <h3 className="text-lg font-bold text-slate-900 dark:text-white flex items-center gap-2">
+                  <span className="text-2xl">🧬</span> AI Health Twin
+                </h3>
+                <div className="mt-4 grid gap-4 sm:grid-cols-3">
+                  {/* Health Score Circle */}
+                  <div className="flex flex-col items-center">
+                    <div className={`relative w-32 h-32 rounded-full flex items-center justify-center animate-breathe ${healthTwin.status === "good" ? "bg-gradient-to-br from-emerald-400/20 to-teal-500/20 pulse-glow" :
+                      healthTwin.status === "moderate" ? "bg-gradient-to-br from-amber-400/20 to-yellow-500/20" :
+                        "bg-gradient-to-br from-red-400/20 to-rose-500/20"
+                      }`}>
+                      <div className="text-center">
+                        <div className="text-3xl font-bold gradient-text">{healthTwin.healthScore}</div>
+                        <div className="text-[10px] text-slate-500 dark:text-slate-400">Health Score</div>
+                      </div>
+                      <div className="absolute inset-0 rounded-full border-4 border-transparent" style={{ borderColor: healthTwin.moodColor + '40' }} />
+                    </div>
+                    <div className="mt-2 text-sm font-medium" style={{ color: healthTwin.moodColor }}>{healthTwin.statusLabel}</div>
+                  </div>
+
+                  {/* Vitals */}
+                  <div className="space-y-3">
+                    <div className="rounded-xl bg-slate-50 dark:bg-slate-800/50 p-3">
+                      <div className="text-xs text-slate-500 dark:text-slate-400">❤️ Pulse (simulated)</div>
+                      <div className="text-xl font-bold text-slate-900 dark:text-white">{healthTwin.pulseRate} <span className="text-xs font-normal">bpm</span></div>
+                    </div>
+                    <div className="rounded-xl bg-slate-50 dark:bg-slate-800/50 p-3">
+                      <div className="text-xs text-slate-500 dark:text-slate-400">🫁 Breathing</div>
+                      <div className="text-xl font-bold text-slate-900 dark:text-white">{healthTwin.breathRate} <span className="text-xs font-normal">/min</span></div>
+                    </div>
+                    <div className="rounded-xl bg-slate-50 dark:bg-slate-800/50 p-3">
+                      <div className="text-xs text-slate-500 dark:text-slate-400">⚡ Energy</div>
+                      <div className="flex items-center gap-2">
+                        <div className="flex-1 h-2 bg-slate-200 dark:bg-slate-700 rounded-full overflow-hidden">
+                          <div className="h-full bg-gradient-to-r from-emerald-400 to-teal-500 rounded-full transition-all" style={{ width: `${healthTwin.energyLevel}%` }} />
+                        </div>
+                        <span className="text-sm font-bold text-slate-900 dark:text-white">{healthTwin.energyLevel}%</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Body Zones */}
+                  <div>
+                    <div className="text-xs text-slate-500 dark:text-slate-400 mb-2">Active Zones</div>
+                    <div className="space-y-2">
+                      {healthTwin.zones?.map((z: any, i: number) => (
+                        <div key={i} className="flex items-center gap-2 rounded-lg bg-slate-50 dark:bg-slate-800/50 p-2">
+                          <div className={`w-3 h-3 rounded-full ${z.severity > 0.6 ? "bg-red-500" : z.severity > 0.3 ? "bg-amber-500" : "bg-emerald-500"
+                            }`} />
+                          <div>
+                            <div className="text-xs font-medium text-slate-900 dark:text-white capitalize">{z.zone}</div>
+                            <div className="text-[10px] text-slate-500 dark:text-slate-400">{z.label}</div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* --- Correlation Heatmap --- */}
+            {correlations && correlations.matrix?.length > 0 && (
+              <div className="card-glass p-6">
+                <h3 className="text-lg font-bold text-slate-900 dark:text-white flex items-center gap-2">
+                  <span className="text-2xl">📊</span> Correlation Matrix
+                </h3>
+                <div className="mt-4 overflow-x-auto">
+                  <table className="w-full max-w-md">
+                    <thead>
+                      <tr>
+                        <th className="text-xs text-slate-500 dark:text-slate-400 p-2"></th>
+                        {correlations.labels?.map((l: string) => (
+                          <th key={l} className="text-xs text-slate-700 dark:text-slate-300 p-2 font-medium">{l}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {correlations.matrix?.map((row: number[], ri: number) => (
+                        <tr key={ri}>
+                          <td className="text-xs text-slate-700 dark:text-slate-300 p-2 font-medium">{correlations.labels?.[ri]}</td>
+                          {row.map((val: number, ci: number) => {
+                            const cls = val >= 0.5 ? "heatmap-strong-pos" : val >= 0.2 ? "heatmap-mild-pos" : val <= -0.5 ? "heatmap-strong-neg" : val <= -0.2 ? "heatmap-mild-neg" : "heatmap-neutral";
+                            return (
+                              <td key={ci} className={`p-2 text-center rounded-lg ${cls}`}>
+                                <span className="text-xs font-bold text-slate-900 dark:text-white">{val.toFixed(2)}</span>
+                              </td>
+                            );
+                          })}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                {correlations.tagCorrelations?.length > 0 && (
+                  <div className="mt-4">
+                    <div className="text-xs text-slate-500 dark:text-slate-400 mb-2">Tag Impact</div>
+                    <div className="flex flex-wrap gap-2">
+                      {correlations.tagCorrelations.map((tc: any) => (
+                        <div key={tc.tag} className="rounded-xl bg-slate-50 dark:bg-slate-800/50 border border-slate-200 dark:border-slate-700 px-3 py-2">
+                          <div className="text-xs font-semibold text-slate-900 dark:text-white">#{tc.tag}</div>
+                          <div className="text-[10px] text-slate-500 dark:text-slate-400">
+                            Sym: {tc.avgSymptom} • Mood: {tc.avgMood} • {tc.count}x
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* --- Gamification / Streaks --- */}
+            {streaks && (
+              <div className="card-glass p-6">
+                <h3 className="text-lg font-bold text-slate-900 dark:text-white flex items-center gap-2">
+                  <span className="text-2xl">🏅</span> Your Progress
+                </h3>
+                <div className="mt-4 grid gap-4 sm:grid-cols-4">
+                  <div className="text-center rounded-xl bg-gradient-to-br from-orange-50 to-amber-50 dark:from-orange-950/30 dark:to-amber-950/30 p-4">
+                    <div className="text-3xl">🔥</div>
+                    <div className="text-2xl font-bold text-orange-600 dark:text-orange-400">{streaks.currentStreak}</div>
+                    <div className="text-[10px] text-slate-500 dark:text-slate-400">Day Streak</div>
+                  </div>
+                  <div className="text-center rounded-xl bg-gradient-to-br from-violet-50 to-purple-50 dark:from-violet-950/30 dark:to-purple-950/30 p-4">
+                    <div className="text-3xl">⭐</div>
+                    <div className="text-2xl font-bold text-violet-600 dark:text-violet-400">{streaks.longestStreak}</div>
+                    <div className="text-[10px] text-slate-500 dark:text-slate-400">Best Streak</div>
+                  </div>
+                  <div className="text-center rounded-xl bg-gradient-to-br from-emerald-50 to-teal-50 dark:from-emerald-950/30 dark:to-teal-950/30 p-4">
+                    <div className="text-3xl">📝</div>
+                    <div className="text-2xl font-bold text-emerald-600 dark:text-emerald-400">{streaks.totalEntries}</div>
+                    <div className="text-[10px] text-slate-500 dark:text-slate-400">Total Entries</div>
+                  </div>
+                  <div className="text-center rounded-xl bg-gradient-to-br from-blue-50 to-cyan-50 dark:from-blue-950/30 dark:to-cyan-950/30 p-4">
+                    <div className="text-3xl">🎮</div>
+                    <div className="text-2xl font-bold text-blue-600 dark:text-blue-400">Lv.{streaks.xp?.level}</div>
+                    <div className="text-[10px] text-slate-500 dark:text-slate-400">{streaks.xp?.total} XP</div>
+                  </div>
+                </div>
+
+                {/* XP Progress bar */}
+                {streaks.xp && (
+                  <div className="mt-4">
+                    <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400 mb-1">
+                      <span>Level {streaks.xp.level}</span>
+                      <span>{streaks.xp.xpToNext} XP to next</span>
+                    </div>
+                    <div className="h-3 bg-slate-200 dark:bg-slate-700 rounded-full overflow-hidden">
+                      <div className="h-full bg-gradient-to-r from-blue-500 via-violet-500 to-purple-500 rounded-full transition-all duration-500" style={{ width: `${streaks.xp.progressPct}%` }} />
+                    </div>
+                  </div>
+                )}
+
+                {/* Badges */}
+                <div className="mt-4 flex flex-wrap gap-3">
+                  {streaks.badges?.map((b: any, i: number) => (
+                    <div key={b.name} className={`flex items-center gap-2 rounded-xl px-3 py-2 text-xs border transition-all ${b.earned
+                      ? "bg-gradient-to-r from-amber-50 to-yellow-50 dark:from-amber-950/30 dark:to-yellow-950/30 border-amber-200 dark:border-amber-800 animate-badge-pop"
+                      : "bg-slate-50 dark:bg-slate-800/50 border-slate-200 dark:border-slate-700 opacity-50"
+                      }`} style={{ animationDelay: `${i * 100}ms` }}>
+                      <span className="text-xl">{b.icon}</span>
+                      <div>
+                        <div className={`font-semibold ${b.earned ? "text-amber-700 dark:text-amber-300" : "text-slate-500 dark:text-slate-500"}`}>{b.name}</div>
+                        <div className="text-[10px] text-slate-500 dark:text-slate-400">{b.description}</div>
+                      </div>
+                      {b.earned && <span className="text-emerald-500 ml-1">✓</span>}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* --- Predictive Insights (enhanced) --- */}
+            {predictiveInsights && Array.isArray(predictiveInsights) && (
+              <div className="card-glass p-6">
+                <h3 className="text-lg font-bold text-slate-900 dark:text-white flex items-center gap-2">
+                  <span className="text-2xl">📈</span> Predictive Insights
+                </h3>
+                <div className="mt-4 space-y-3">
+                  {(predictiveInsights as any[]).map((ins: any, i: number) => (
+                    <div key={i} className="flex items-start gap-3 rounded-xl bg-slate-50 dark:bg-slate-800/50 p-3">
+                      <span className="text-2xl">{ins.icon}</span>
+                      <div>
+                        <div className="text-sm font-semibold text-slate-900 dark:text-white">{ins.title}</div>
+                        <div className="text-xs text-slate-600 dark:text-slate-400 mt-0.5">{ins.description}</div>
+                        <span className={`mt-1 inline-block rounded-full px-2 py-0.5 text-[10px] font-medium ${ins.confidence === "high" ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300" :
+                          ins.confidence === "medium" ? "bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300" :
+                            "bg-slate-100 text-slate-600 dark:bg-slate-700 dark:text-slate-300"
+                          }`}>{ins.confidence} confidence</span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </section>
+        )}
+
+        <footer className="mt-8 text-xs text-slate-500 dark:text-slate-400">
+          API calls go to <code className="rounded bg-slate-100 dark:bg-slate-800 px-1">/api/*</code> (proxy via{" "}
+          <code className="rounded bg-slate-100 dark:bg-slate-800 px-1">API_PROXY_TARGET</code>). For demos, keep inputs synthetic.
         </footer>
       </div>
     </main>
+  );
+}
+
+export default function PatientPage() {
+  return (
+    <Suspense fallback={<div className="p-8 text-center text-slate-500">Loading Patient View...</div>}>
+      <PatientPageContent />
+    </Suspense>
   );
 }
